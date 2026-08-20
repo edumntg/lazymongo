@@ -71,7 +71,6 @@ fn timestamp() -> u64 {
 }
 
 /// Session clock "hh:mm:ss" (UTC) for the ops log.
-#[allow(dead_code)] // wired up by the write-ops log (M3)
 pub fn clock_utc() -> String {
     let s = timestamp();
     format!("{:02}:{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60, s % 60)

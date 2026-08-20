@@ -4,6 +4,7 @@ mod input;
 mod json_view;
 mod modal;
 mod term;
+mod textarea;
 mod ui;
 mod util;
 

@@ -1,13 +1,13 @@
 //! Application model and update loop (Elm-style): one `App` struct, updated
 //! by input events and core events, rendered by `ui::draw`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use lazymongo_core::actor;
-use lazymongo_core::bson::Document;
-use lazymongo_core::query::{parse_filter, parse_optional_doc};
+use lazymongo_core::bson::{Bson, Document};
+use lazymongo_core::query::{parse_doc, parse_filter, parse_optional_doc};
 use lazymongo_core::types::{
     CollectionInfo, Command, CoreEvent, DatabaseInfo, FindSpec, BATCH_SIZE,
 };
@@ -17,9 +17,13 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use tokio::sync::mpsc;
 
-use crate::input::char_to_byte;
+use crate::input::{char_to_byte, Input};
 use crate::json_view::{doc_lines, RLine};
-use crate::modal::{DocView, Modal, QueryEditor};
+use crate::modal::{
+    Confirm, DocView, EditorPurpose, IndexesView, JsonEditor, Modal, PendingAction, Prompt,
+    PromptAction, QueryEditor,
+};
+use crate::textarea::TextArea;
 use crate::{event, term, ui, util};
 
 /// Memory cap: max documents held in the sliding window (NFR-3).
@@ -77,12 +81,13 @@ impl Explorer {
         let mut rows = Vec::new();
         for (di, node) in self.dbs.iter().enumerate() {
             let db_match = needle.is_empty() || node.info.name.to_lowercase().contains(&needle);
+            // A db whose own name matches shows all of its collections.
             let matching_colls: Vec<usize> = node
                 .colls
                 .iter()
                 .flatten()
                 .enumerate()
-                .filter(|(_, c)| needle.is_empty() || c.name.to_lowercase().contains(&needle))
+                .filter(|(_, c)| db_match || c.name.to_lowercase().contains(&needle))
                 .map(|(i, _)| i)
                 .collect();
             if !db_match && matching_colls.is_empty() {
@@ -215,6 +220,12 @@ impl SpecExtras {
     }
 }
 
+/// What an in-flight countDocuments (dry run) is for.
+enum PendingCount {
+    DeleteMany { filter: Document },
+    UpdateMany { filter: Document, update: Document },
+}
+
 pub struct App {
     pub conn: ConnState,
     pub uri_display: String,
@@ -226,6 +237,10 @@ pub struct App {
     pub query: QueryBar,
     pub extras: SpecExtras,
     pub modal: Modal,
+    /// Session log of completed write operations (FR-32).
+    pub ops_log: Vec<String>,
+    pending_counts: HashMap<u64, PendingCount>,
+    next_req_id: u64,
     pub toast: Option<(String, bool, Instant)>, // (message, is_error, when)
     pub spinner_frame: usize,
     pub should_quit: bool,
@@ -250,6 +265,9 @@ impl App {
             query: QueryBar::default(),
             extras: SpecExtras::default(),
             modal: Modal::None,
+            ops_log: Vec::new(),
+            pending_counts: HashMap::new(),
+            next_req_id: 0,
             toast: None,
             spinner_frame: 0,
             should_quit: false,
@@ -363,11 +381,75 @@ impl App {
                 self.results.loading = false;
                 self.toast_err(e);
             }
-            // Wired up with the write flows (M3) and aggregations (M4).
-            CoreEvent::WriteDone { summary, .. } => self.toast_info(summary),
-            CoreEvent::CountResult { .. }
-            | CoreEvent::Indexes { .. }
-            | CoreEvent::AggBatch { .. } => {}
+            CoreEvent::WriteDone {
+                namespace,
+                summary,
+                refresh,
+            } => {
+                self.ops_log
+                    .push(format!("{}  {namespace}: {summary}", util::clock_utc()));
+                self.toast_info(summary);
+                let current_ns = self
+                    .results
+                    .target
+                    .as_ref()
+                    .map(|(d, c)| format!("{d}.{c}"));
+                if refresh && current_ns.as_deref() == Some(namespace.as_str()) {
+                    self.rerun_find();
+                }
+            }
+            CoreEvent::CountResult { req_id, n } => self.on_count_result(req_id, n),
+            CoreEvent::Indexes { db, coll, indexes } => {
+                if let Modal::Indexes(view) = &mut self.modal {
+                    if view.db == db && view.coll == coll {
+                        view.selected = view.selected.min(indexes.len().saturating_sub(1));
+                        view.indexes = Some(indexes);
+                    }
+                }
+            }
+            // Aggregations arrive with M4.
+            CoreEvent::AggBatch { .. } => {}
+        }
+    }
+
+    /// A dry-run count came back: open the corresponding confirmation.
+    fn on_count_result(&mut self, req_id: u64, n: u64) {
+        let Some(pending) = self.pending_counts.remove(&req_id) else {
+            return;
+        };
+        if n == 0 {
+            self.toast_info("filter matches 0 documents — nothing to do".into());
+            return;
+        }
+        match pending {
+            PendingCount::DeleteMany { filter } => {
+                self.modal = Modal::Confirm(Confirm {
+                    title: "Delete many".into(),
+                    body: vec![
+                        format!("filter: {}", filter_display(&filter)),
+                        format!("{n} document(s) will be PERMANENTLY deleted."),
+                        String::new(),
+                        format!("Type the count ({n}) to confirm:"),
+                    ],
+                    typed_required: Some(n.to_string()),
+                    typed: Input::default(),
+                    action: PendingAction::DeleteMany { filter },
+                });
+            }
+            PendingCount::UpdateMany { filter, update } => {
+                self.modal = Modal::Confirm(Confirm {
+                    title: "Update many".into(),
+                    body: vec![
+                        format!("filter: {}", filter_display(&filter)),
+                        format!("update: {}", filter_display(&update)),
+                        String::new(),
+                        format!("{n} document(s) will be modified."),
+                    ],
+                    typed_required: None,
+                    typed: Input::default(),
+                    action: PendingAction::UpdateMany { filter, update },
+                });
+            }
         }
     }
 
@@ -467,7 +549,304 @@ impl App {
                     editor.error = None;
                 }
             },
+            Modal::Confirm(confirm) => match key.code {
+                KeyCode::Esc | KeyCode::Char('n') if confirm.typed_required.is_none() => {
+                    self.modal = Modal::None;
+                    self.toast_info("cancelled".into());
+                }
+                KeyCode::Esc => {
+                    self.modal = Modal::None;
+                    self.toast_info("cancelled".into());
+                }
+                KeyCode::Enter => self.confirm_execute(),
+                KeyCode::Char('y') if confirm.typed_required.is_none() => self.confirm_execute(),
+                _ => {
+                    if confirm.typed_required.is_some() {
+                        confirm.typed.on_key(key);
+                    }
+                }
+            },
+            Modal::Editor(editor) => match key.code {
+                KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.submit_json_editor();
+                }
+                _ => {
+                    if editor.area.on_key(key) {
+                        editor.error = None;
+                    }
+                }
+            },
+            Modal::Indexes(view) => {
+                let count = view.indexes.as_ref().map(Vec::len).unwrap_or(0);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        view.selected = (view.selected + 1).min(count.saturating_sub(1))
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        view.selected = view.selected.saturating_sub(1)
+                    }
+                    KeyCode::Char('r') => {
+                        let (db, coll) = (view.db.clone(), view.coll.clone());
+                        view.indexes = None;
+                        self.send(Command::ListIndexes { db, coll });
+                    }
+                    KeyCode::Char('c') => {
+                        if self.guard_write() {
+                            self.modal = Modal::Editor(JsonEditor {
+                                title: "Create index — key spec".into(),
+                                area: TextArea::from_text("{\n  \n}"),
+                                purpose: EditorPurpose::CreateIndexKeys,
+                                error: None,
+                            });
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        let name = view
+                            .indexes
+                            .as_ref()
+                            .and_then(|list| list.get(view.selected))
+                            .map(|i| i.name.clone());
+                        let Some(name) = name else { return };
+                        if name == "_id_" {
+                            self.toast_err("the _id index cannot be dropped".into());
+                            return;
+                        }
+                        if self.guard_write() {
+                            self.modal = Modal::Confirm(Confirm {
+                                title: "Drop index".into(),
+                                body: vec![format!("Drop index \"{name}\"?")],
+                                typed_required: None,
+                                typed: Input::default(),
+                                action: PendingAction::DropIndex { name },
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Modal::OpsLog { scroll } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('L') => self.modal = Modal::None,
+                KeyCode::Down | KeyCode::Char('j') => *scroll += 1,
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::Char('g') | KeyCode::Home => *scroll = 0,
+                _ => {}
+            },
+            Modal::Prompt(prompt) => match key.code {
+                KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Enter => self.submit_prompt(),
+                _ => {
+                    prompt.input.on_key(key);
+                }
+            },
         }
+    }
+
+    /// Execute the confirmed pending action.
+    fn confirm_execute(&mut self) {
+        let Modal::Confirm(confirm) = &self.modal else {
+            return;
+        };
+        if !confirm.typed_ok() {
+            self.toast_err("confirmation text does not match".into());
+            return;
+        }
+        let Modal::Confirm(confirm) = std::mem::replace(&mut self.modal, Modal::None) else {
+            return;
+        };
+        let target = self.results.target.clone();
+        match confirm.action {
+            PendingAction::ApplyEdit { id, doc } => {
+                if let Some((db, coll)) = target {
+                    self.send(Command::ReplaceOne { db, coll, id, doc });
+                }
+            }
+            PendingAction::DeleteOne { id } => {
+                if let Some((db, coll)) = target {
+                    self.send(Command::DeleteOne { db, coll, id });
+                }
+            }
+            PendingAction::DeleteMany { filter } => {
+                if let Some((db, coll)) = target {
+                    self.send(Command::DeleteMany { db, coll, filter });
+                }
+            }
+            PendingAction::UpdateMany { filter, update } => {
+                if let Some((db, coll)) = target {
+                    self.send(Command::UpdateMany {
+                        db,
+                        coll,
+                        filter,
+                        update,
+                    });
+                }
+            }
+            PendingAction::CreateIndex { keys } => {
+                if let Some((db, coll)) = target {
+                    self.modal = Modal::Indexes(IndexesView {
+                        db: db.clone(),
+                        coll: coll.clone(),
+                        indexes: None,
+                        selected: 0,
+                    });
+                    self.send(Command::CreateIndex { db, coll, keys });
+                }
+            }
+            PendingAction::DropIndex { name } => {
+                if let Some((db, coll)) = target {
+                    self.modal = Modal::Indexes(IndexesView {
+                        db: db.clone(),
+                        coll: coll.clone(),
+                        indexes: None,
+                        selected: 0,
+                    });
+                    self.send(Command::DropIndex { db, coll, name });
+                }
+            }
+            PendingAction::DropCollection { db, coll } => {
+                // If the dropped collection is open, clear the results pane.
+                if self.results.target.as_ref() == Some(&(db.clone(), coll.clone())) {
+                    self.results = Results::default();
+                }
+                self.send(Command::DropCollection { db, coll });
+            }
+        }
+    }
+
+    /// Parse and route the JSON editor's content on Ctrl-S.
+    fn submit_json_editor(&mut self) {
+        let Modal::Editor(editor) = &mut self.modal else {
+            return;
+        };
+        let text = editor.area.text();
+        let parsed = match parse_doc(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                editor.error = Some(e);
+                return;
+            }
+        };
+        let Modal::Editor(editor) = std::mem::replace(&mut self.modal, Modal::None) else {
+            return;
+        };
+        match editor.purpose {
+            EditorPurpose::EditDoc { id, original } => {
+                if let Some(new_id) = parsed.get("_id") {
+                    if *new_id != id {
+                        self.modal = Modal::Editor(JsonEditor {
+                            error: Some(
+                                "_id cannot be changed; revert it or remove the field".into(),
+                            ),
+                            ..editor_with(
+                                editor.title,
+                                text,
+                                EditorPurpose::EditDoc { id, original },
+                            )
+                        });
+                        return;
+                    }
+                }
+                let mut doc = parsed;
+                doc.remove("_id"); // replaceOne rejects _id in the replacement
+                let summary = diff_summary(&original, &doc);
+                self.modal = Modal::Confirm(Confirm {
+                    title: "Apply edit".into(),
+                    body: vec![
+                        format!("_id: {}", bson_display(&id)),
+                        format!("changes: {summary}"),
+                    ],
+                    typed_required: None,
+                    typed: Input::default(),
+                    action: PendingAction::ApplyEdit { id, doc },
+                });
+            }
+            EditorPurpose::InsertDoc => {
+                let Some((db, coll)) = self.results.target.clone() else {
+                    return;
+                };
+                self.send(Command::InsertOne {
+                    db,
+                    coll,
+                    doc: parsed,
+                });
+            }
+            EditorPurpose::UpdateMany { filter } => {
+                if !parsed.keys().any(|k| k.starts_with('$')) {
+                    self.modal = Modal::Editor(JsonEditor {
+                        error: Some("update must use operators like $set / $unset / $inc".into()),
+                        ..editor_with(editor.title, text, EditorPurpose::UpdateMany { filter })
+                    });
+                    return;
+                }
+                self.request_count(PendingCount::UpdateMany {
+                    filter,
+                    update: parsed,
+                });
+            }
+            EditorPurpose::CreateIndexKeys => {
+                if parsed.is_empty() {
+                    self.modal = Modal::Editor(JsonEditor {
+                        error: Some("index key spec cannot be empty".into()),
+                        ..editor_with(editor.title, text, EditorPurpose::CreateIndexKeys)
+                    });
+                    return;
+                }
+                self.modal = Modal::Confirm(Confirm {
+                    title: "Create index".into(),
+                    body: vec![format!("keys: {}", filter_display(&parsed))],
+                    typed_required: None,
+                    typed: Input::default(),
+                    action: PendingAction::CreateIndex { keys: parsed },
+                });
+            }
+        }
+    }
+
+    fn submit_prompt(&mut self) {
+        let Modal::Prompt(prompt) = std::mem::replace(&mut self.modal, Modal::None) else {
+            return;
+        };
+        let value = prompt.input.text.trim().to_string();
+        if value.is_empty() {
+            self.toast_err("name cannot be empty".into());
+            return;
+        }
+        match prompt.action {
+            PromptAction::CreateCollection { db } => {
+                self.send(Command::CreateCollection { db, name: value });
+            }
+        }
+    }
+
+    /// Kick off a dry-run count; the confirm modal opens when it returns.
+    fn request_count(&mut self, pending: PendingCount) {
+        let Some((db, coll)) = self.results.target.clone() else {
+            return;
+        };
+        let filter = match &pending {
+            PendingCount::DeleteMany { filter } => filter.clone(),
+            PendingCount::UpdateMany { filter, .. } => filter.clone(),
+        };
+        self.next_req_id += 1;
+        let req_id = self.next_req_id;
+        self.pending_counts.insert(req_id, pending);
+        self.toast_info("counting matching documents…".into());
+        self.send(Command::Count {
+            req_id,
+            db,
+            coll,
+            filter,
+        });
+    }
+
+    /// False (with a toast) when writes are blocked (FR-4).
+    fn guard_write(&mut self) -> bool {
+        if self.read_only {
+            self.toast_err("read-only mode: write operations are disabled".into());
+            return false;
+        }
+        true
     }
 
     fn open_query_editor(&mut self) {
@@ -615,6 +994,8 @@ impl App {
             KeyCode::Char('/') => {
                 self.explorer.filtering = true;
             }
+            KeyCode::Char('N') => self.new_collection_prompt(),
+            KeyCode::Char('X') => self.drop_collection_confirm(),
             KeyCode::Esc => {
                 self.explorer.filter.clear();
             }
@@ -622,6 +1003,57 @@ impl App {
         }
         let n = self.explorer.rows().len();
         self.explorer.selected = self.explorer.selected.min(n.saturating_sub(1));
+    }
+
+    /// Create a collection in the db under the cursor (FR-31).
+    fn new_collection_prompt(&mut self) {
+        if !self.guard_write() {
+            return;
+        }
+        let rows = self.explorer.rows();
+        let Some(row) = rows.get(self.explorer.selected).copied() else {
+            return;
+        };
+        let db = match row {
+            ExplorerRow::Db(di) | ExplorerRow::Coll { db: di, .. } => {
+                self.explorer.dbs[di].info.name.clone()
+            }
+        };
+        self.modal = Modal::Prompt(Prompt {
+            title: format!("New collection in {db}"),
+            input: Input::default(),
+            action: PromptAction::CreateCollection { db },
+        });
+    }
+
+    /// Drop the collection under the cursor; requires typing its name (FR-31).
+    fn drop_collection_confirm(&mut self) {
+        if !self.guard_write() {
+            return;
+        }
+        let rows = self.explorer.rows();
+        let Some(ExplorerRow::Coll { db, coll }) = rows.get(self.explorer.selected).copied() else {
+            self.toast_err("select a collection to drop".into());
+            return;
+        };
+        let db_name = self.explorer.dbs[db].info.name.clone();
+        let coll_name = self.explorer.dbs[db].colls.as_ref().unwrap()[coll]
+            .name
+            .clone();
+        self.modal = Modal::Confirm(Confirm {
+            title: "Drop collection".into(),
+            body: vec![
+                format!("{db_name}.{coll_name} and ALL its documents will be dropped."),
+                String::new(),
+                format!("Type the collection name ({coll_name}) to confirm:"),
+            ],
+            typed_required: Some(coll_name.clone()),
+            typed: Input::default(),
+            action: PendingAction::DropCollection {
+                db: db_name,
+                coll: coll_name,
+            },
+        });
     }
 
     fn on_key_explorer_filter(&mut self, key: KeyEvent) {
@@ -702,12 +1134,140 @@ impl App {
             KeyCode::Char('o') => return self.open_doc_view(),
             KeyCode::Char('y') => return self.copy_current_doc(),
             KeyCode::Char('E') => return self.export_results(),
+            KeyCode::Char('e') => return self.edit_current_doc(),
+            KeyCode::Char('i') => return self.insert_doc_flow(),
+            KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return self.delete_current_doc()
+            }
+            KeyCode::Char('D') => return self.delete_many_flow(),
+            KeyCode::Char('U') => return self.update_many_flow(),
+            KeyCode::Char('I') => return self.open_indexes(),
+            KeyCode::Char('L') => {
+                self.modal = Modal::OpsLog { scroll: 0 };
+                return;
+            }
             _ => {}
         }
         match self.view {
             ViewMode::Json => self.on_key_results_json(key),
             ViewMode::Table => self.on_key_results_table(key),
         }
+    }
+
+    // ---------- write flows (M3) ----------
+
+    fn edit_current_doc(&mut self) {
+        if !self.guard_write() {
+            return;
+        }
+        let Some(idx) = self.current_doc_idx() else {
+            return;
+        };
+        let doc = self.results.docs[idx].clone();
+        let Some(id) = doc.get("_id").cloned() else {
+            self.toast_err("document has no _id; cannot edit safely".into());
+            return;
+        };
+        self.modal = Modal::Editor(JsonEditor {
+            title: format!("Edit document _id={}", bson_display(&id)),
+            area: TextArea::from_text(&util::doc_to_pretty(&doc)),
+            purpose: EditorPurpose::EditDoc { id, original: doc },
+            error: None,
+        });
+    }
+
+    fn insert_doc_flow(&mut self) {
+        if !self.guard_write() {
+            return;
+        }
+        if self.results.target.is_none() {
+            self.toast_err("select a collection first".into());
+            return;
+        }
+        self.modal = Modal::Editor(JsonEditor {
+            title: "Insert document".into(),
+            area: TextArea::from_text("{\n  \n}"),
+            purpose: EditorPurpose::InsertDoc,
+            error: None,
+        });
+    }
+
+    fn delete_current_doc(&mut self) {
+        if !self.guard_write() {
+            return;
+        }
+        let Some(idx) = self.current_doc_idx() else {
+            return;
+        };
+        let doc = &self.results.docs[idx];
+        let Some(id) = doc.get("_id").cloned() else {
+            self.toast_err("document has no _id; cannot delete safely".into());
+            return;
+        };
+        let mut preview: Vec<String> = doc
+            .iter()
+            .take(4)
+            .map(|(k, v)| format!("  {k}: {}", util::bson_to_compact(v)))
+            .collect();
+        if doc.len() > 4 {
+            preview.push("  …".into());
+        }
+        let mut body = vec![format!("_id: {}", bson_display(&id)), String::new()];
+        body.extend(preview);
+        body.push(String::new());
+        body.push("Delete this document permanently?".into());
+        self.modal = Modal::Confirm(Confirm {
+            title: "Delete document".into(),
+            body,
+            typed_required: None,
+            typed: Input::default(),
+            action: PendingAction::DeleteOne { id },
+        });
+    }
+
+    /// Delete everything matching the current filter (FR-29).
+    fn delete_many_flow(&mut self) {
+        if !self.guard_write() {
+            return;
+        }
+        if self.results.target.is_none() {
+            self.toast_err("select a collection first".into());
+            return;
+        }
+        let filter = self.results.active_spec.filter.clone();
+        self.request_count(PendingCount::DeleteMany { filter });
+    }
+
+    /// Update everything matching the current filter (FR-30).
+    fn update_many_flow(&mut self) {
+        if !self.guard_write() {
+            return;
+        }
+        if self.results.target.is_none() {
+            self.toast_err("select a collection first".into());
+            return;
+        }
+        let filter = self.results.active_spec.filter.clone();
+        self.modal = Modal::Editor(JsonEditor {
+            title: format!("Update many — filter: {}", filter_display(&filter)),
+            area: TextArea::from_text("{\n  $set: {\n    \n  }\n}"),
+            purpose: EditorPurpose::UpdateMany { filter },
+            error: None,
+        });
+    }
+
+    fn open_indexes(&mut self) {
+        let Some((db, coll)) = self.results.target.clone() else {
+            self.toast_err("select a collection first".into());
+            return;
+        };
+        self.modal = Modal::Indexes(IndexesView {
+            db: db.clone(),
+            coll: coll.clone(),
+            indexes: None,
+            selected: 0,
+        });
+        self.send(Command::ListIndexes { db, coll });
     }
 
     fn on_key_results_json(&mut self, key: KeyEvent) {
@@ -1154,6 +1714,71 @@ fn build_spec(
         limit: parse_num(limit, "limit")?,
         skip: parse_num(skip, "skip")?.map(|n| n.max(0) as u64),
     })
+}
+
+/// Compact relaxed-extjson rendering of a filter/update doc for summaries.
+fn filter_display(doc: &Document) -> String {
+    let s = Bson::Document(doc.clone())
+        .into_relaxed_extjson()
+        .to_string();
+    if s.chars().count() > 120 {
+        let truncated: String = s.chars().take(119).collect();
+        format!("{truncated}…")
+    } else {
+        s
+    }
+}
+
+fn bson_display(v: &Bson) -> String {
+    match v {
+        Bson::ObjectId(oid) => format!("ObjectId(\"{oid}\")"),
+        Bson::String(s) => format!("\"{s}\""),
+        other => other.to_string(),
+    }
+}
+
+/// Top-level field diff between the original and edited document.
+fn diff_summary(original: &Document, edited: &Document) -> String {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+    for (k, v) in edited.iter() {
+        match original.get(k) {
+            None => added.push(k.clone()),
+            Some(old) if old != v => changed.push(k.clone()),
+            _ => {}
+        }
+    }
+    for k in original.keys() {
+        if k != "_id" && !edited.contains_key(k) {
+            removed.push(k.clone());
+        }
+    }
+    let mut parts = Vec::new();
+    if !changed.is_empty() {
+        parts.push(format!("~ {}", changed.join(", ")));
+    }
+    if !added.is_empty() {
+        parts.push(format!("+ {}", added.join(", ")));
+    }
+    if !removed.is_empty() {
+        parts.push(format!("- {}", removed.join(", ")));
+    }
+    if parts.is_empty() {
+        "none (documents are identical)".into()
+    } else {
+        parts.join("  ")
+    }
+}
+
+/// Rebuild a JsonEditor preserving the typed text (used to re-show errors).
+fn editor_with(title: String, text: String, purpose: EditorPurpose) -> JsonEditor {
+    JsonEditor {
+        title,
+        area: TextArea::from_text(&text),
+        purpose,
+        error: None,
+    }
 }
 
 /// Strip credentials from a connection string for display.

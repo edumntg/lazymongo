@@ -9,7 +9,9 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, ConnState, ExplorerRow, Pane, ViewMode};
-use crate::modal::{DocView, Modal, QueryEditor, QUERY_FIELD_LABELS};
+use crate::modal::{
+    Confirm, DocView, IndexesView, JsonEditor, Modal, Prompt, QueryEditor, QUERY_FIELD_LABELS,
+};
 use crate::util;
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -523,6 +525,21 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
                 ("esc", "close"),
             ],
             Modal::QueryEditor(_) => &[("tab/↑↓", "field"), ("↵", "run"), ("esc", "cancel")],
+            Modal::Editor(_) => &[("type", "edit json"), ("^s", "save"), ("esc", "cancel")],
+            Modal::Confirm(c) if c.typed_required.is_some() => &[
+                ("type", "confirm text"),
+                ("↵", "confirm"),
+                ("esc", "cancel"),
+            ],
+            Modal::Confirm(_) => &[("y/↵", "confirm"), ("n/esc", "cancel")],
+            Modal::Indexes(_) => &[
+                ("↑↓", "move"),
+                ("c", "create"),
+                ("d", "drop"),
+                ("r", "refresh"),
+                ("esc", "close"),
+            ],
+            Modal::Prompt(_) => &[("type", "name"), ("↵", "ok"), ("esc", "cancel")],
             _ => &[("any key", "close")],
         }
     } else {
@@ -547,8 +564,9 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
                     ("o", "doc"),
                     ("F", "query"),
                     ("x", "explain"),
-                    ("y", "copy"),
-                    ("E", "export"),
+                    ("e", "edit"),
+                    ("i", "insert"),
+                    ("d", "delete"),
                     ("?", "help"),
                 ],
                 ViewMode::Table => &[
@@ -557,8 +575,8 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
                     ("s", "sort"),
                     ("↵", "open doc"),
                     ("v", "json"),
-                    ("F", "query"),
-                    ("E", "csv"),
+                    ("e", "edit"),
+                    ("d", "delete"),
                     ("?", "help"),
                 ],
             },
@@ -599,12 +617,174 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_modal(f: &mut Frame, app: &mut App) {
+    let spin = spinner(app);
     match &mut app.modal {
         Modal::None => {}
         Modal::Help => draw_help_overlay(f, f.area()),
         Modal::QueryEditor(editor) => draw_query_editor(f, f.area(), editor),
         Modal::DocView(view) => draw_doc_view(f, f.area(), view),
+        Modal::Confirm(confirm) => draw_confirm(f, f.area(), confirm),
+        Modal::Editor(editor) => draw_json_editor(f, f.area(), editor),
+        Modal::Indexes(view) => draw_indexes(f, f.area(), view, spin),
+        Modal::OpsLog { scroll } => draw_ops_log(f, f.area(), &app.ops_log, scroll),
+        Modal::Prompt(prompt) => draw_prompt(f, f.area(), prompt),
     }
+}
+
+fn draw_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
+    let h = (confirm.body.len() as u16 + 5).max(8);
+    let popup = centered(area, 64, h);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Red))
+        .title(Line::from(Span::styled(
+            format!(" {} ", confirm.title),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = confirm
+        .body
+        .iter()
+        .map(|s| Line::from(Span::styled(format!(" {s}"), Style::new().fg(Color::White))))
+        .collect();
+    lines.push(Line::raw(""));
+    if confirm.typed_required.is_some() {
+        let mut spans = vec![Span::styled(" > ", Style::new().fg(Color::Yellow))];
+        spans.extend(confirm.typed.spans(true));
+        lines.push(Line::from(spans));
+        let ok = confirm.typed_ok();
+        lines.push(Line::from(Span::styled(
+            if ok {
+                " ↵ confirm · esc cancel"
+            } else {
+                " esc cancel"
+            },
+            Style::new().fg(if ok { Color::Green } else { Color::DarkGray }),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " y/↵ confirm · n/esc cancel",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn draw_json_editor(f: &mut Frame, area: Rect, editor: &mut JsonEditor) {
+    let popup = centered(area, 84, area.height.saturating_sub(6));
+    f.render_widget(Clear, popup);
+    let title = format!(" {} ─ ^s save · esc cancel ", editor.title);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(title);
+    let mut inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if let Some(e) = &editor.error {
+        let err_area = Rect { height: 1, ..inner };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" ✗ {e}"),
+                Style::new().fg(Color::White).bg(Color::Red),
+            ))),
+            err_area,
+        );
+        inner.y += 1;
+        inner.height = inner.height.saturating_sub(1);
+    }
+    editor.area.render(f, inner, true);
+}
+
+fn draw_indexes(f: &mut Frame, area: Rect, view: &IndexesView, spin: &str) {
+    let popup = centered(area, 70, 18);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(format!(
+            " Indexes ─ {}.{} ─ c create · d drop · r refresh · esc close ",
+            view.db, view.coll
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    match &view.indexes {
+        None => lines.push(Line::from(Span::styled(
+            format!(" {spin} loading…"),
+            Style::new().fg(Color::Yellow),
+        ))),
+        Some(list) if list.is_empty() => lines.push(Line::from(Span::styled(
+            " no indexes",
+            Style::new().fg(Color::DarkGray),
+        ))),
+        Some(list) => {
+            for (i, idx) in list.iter().enumerate() {
+                let unique = if idx.unique { "  [unique]" } else { "" };
+                let keys_json = lazymongo_core::bson::Bson::Document(idx.keys.clone())
+                    .into_relaxed_extjson()
+                    .to_string();
+                let mut line = Line::from(vec![
+                    Span::styled(format!(" {:<24}", idx.name), Style::new().fg(Color::Cyan)),
+                    Span::styled(keys_json, Style::new().fg(Color::White)),
+                    Span::styled(unique, Style::new().fg(Color::Yellow)),
+                ]);
+                if i == view.selected {
+                    line.style = Style::new().bg(Color::Blue);
+                }
+                lines.push(line);
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn draw_ops_log(f: &mut Frame, area: Rect, log: &[String], scroll: &mut usize) {
+    let popup = centered(area, 90, 20);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(format!(
+            " Operations log ({} · session, UTC) ─ esc close ",
+            log.len()
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    *scroll = (*scroll).min(log.len().saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    if log.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no write operations this session",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    for entry in log.iter().skip(*scroll).take(inner.height as usize) {
+        lines.push(Line::from(Span::styled(
+            format!(" {entry}"),
+            Style::new().fg(Color::White),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn draw_prompt(f: &mut Frame, area: Rect, prompt: &Prompt) {
+    let popup = centered(area, 54, 5);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(format!(" {} ─ ↵ ok · esc cancel ", prompt.title));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let mut spans = vec![Span::styled(" > ", Style::new().fg(Color::Yellow))];
+    spans.extend(prompt.input.spans(true));
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 fn draw_query_editor(f: &mut Frame, area: Rect, editor: &QueryEditor) {
@@ -711,6 +891,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         head("Explorer"),
         Line::from(vec![key("↵ / → / l"), txt("expand db · open collection")]),
         Line::from(vec![key("/"), txt("filter databases & collections")]),
+        Line::from(vec![key("N / X"), txt("new collection · drop collection")]),
         Line::raw(""),
         head("Results (both views)"),
         Line::from(vec![key("v"), txt("toggle json / table view")]),
@@ -722,6 +903,18 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("o"), txt("open document full-screen")]),
         Line::from(vec![key("y"), txt("copy document to clipboard")]),
         Line::from(vec![key("E"), txt("export loaded docs (json / csv)")]),
+        Line::raw(""),
+        head("Writes (blocked in read-only mode)"),
+        Line::from(vec![key("e / i"), txt("edit document · insert document")]),
+        Line::from(vec![
+            key("d / D"),
+            txt("delete doc · delete by filter (dry run)"),
+        ]),
+        Line::from(vec![
+            key("U"),
+            txt("update many by filter (dry run + confirm)"),
+        ]),
+        Line::from(vec![key("I / L"), txt("indexes · operations log")]),
         Line::raw(""),
         head("Results · json view"),
         Line::from(vec![key("↵ / space"), txt("fold / unfold at cursor")]),

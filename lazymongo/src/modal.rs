@@ -2,16 +2,23 @@
 
 use std::collections::HashSet;
 
-use lazymongo_core::bson::Document;
+use lazymongo_core::bson::{Bson, Document};
+use lazymongo_core::types::IndexInfo;
 
 use crate::input::Input;
 use crate::json_view::{doc_lines, RLine};
+use crate::textarea::TextArea;
 
 pub enum Modal {
     None,
     Help,
     QueryEditor(QueryEditor),
     DocView(DocView),
+    Confirm(Confirm),
+    Editor(JsonEditor),
+    Indexes(IndexesView),
+    OpsLog { scroll: usize },
+    Prompt(Prompt),
 }
 
 impl Modal {
@@ -90,4 +97,75 @@ impl DocView {
         }
         self.rebuild();
     }
+}
+
+/// A destructive (or write) action waiting for confirmation (FR-29/30/31).
+pub enum PendingAction {
+    ApplyEdit { id: Bson, doc: Document },
+    DeleteOne { id: Bson },
+    DeleteMany { filter: Document },
+    UpdateMany { filter: Document, update: Document },
+    CreateIndex { keys: Document },
+    DropIndex { name: String },
+    DropCollection { db: String, coll: String },
+}
+
+/// Confirmation modal. When `typed_required` is set, the user must type
+/// that exact string before `y`/Enter confirms (FR-29 delete-many,
+/// FR-31 drop collection).
+pub struct Confirm {
+    pub title: String,
+    pub body: Vec<String>,
+    pub typed_required: Option<String>,
+    pub typed: Input,
+    pub action: PendingAction,
+}
+
+impl Confirm {
+    pub fn typed_ok(&self) -> bool {
+        match &self.typed_required {
+            None => true,
+            Some(required) => self.typed.text.trim() == required.as_str(),
+        }
+    }
+}
+
+/// What the JSON editor's submitted content is for.
+pub enum EditorPurpose {
+    /// Replace the document with this _id (FR-27).
+    EditDoc { id: Bson, original: Document },
+    /// Insert a new document (FR-28).
+    InsertDoc,
+    /// Update document for update-many over the current filter (FR-30).
+    UpdateMany { filter: Document },
+    /// Key spec for a new index (FR-31).
+    CreateIndexKeys,
+}
+
+/// Multi-line JSON editor modal (Ctrl-S submits).
+pub struct JsonEditor {
+    pub title: String,
+    pub area: TextArea,
+    pub purpose: EditorPurpose,
+    pub error: Option<String>,
+}
+
+/// Index list for the current collection (FR-10/FR-31).
+pub struct IndexesView {
+    pub db: String,
+    pub coll: String,
+    pub indexes: Option<Vec<IndexInfo>>, // None while loading
+    pub selected: usize,
+}
+
+/// What a submitted prompt value is used for.
+pub enum PromptAction {
+    CreateCollection { db: String },
+}
+
+/// Tiny single-line prompt (e.g. new collection name).
+pub struct Prompt {
+    pub title: String,
+    pub input: Input,
+    pub action: PromptAction,
 }
