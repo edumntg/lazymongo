@@ -1,8 +1,8 @@
 # lazymongo — Product Requirements Document
 
-**Version:** 0.1 (draft)
+**Version:** 0.1
 **Date:** 2026-08-20
-**Status:** Proposed
+**Status:** M0–M4 implemented (see README.md for what shipped vs. deferred)
 **Author:** Eduardo Montilva (with Claude)
 
 ---
