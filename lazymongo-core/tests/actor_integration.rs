@@ -5,8 +5,9 @@
 use std::time::Duration;
 
 use lazymongo_core::actor;
-use lazymongo_core::query::parse_filter;
-use lazymongo_core::types::{Command, CoreEvent, BATCH_SIZE};
+use lazymongo_core::bson::{doc, Bson};
+use lazymongo_core::query::{parse_filter, parse_pipeline};
+use lazymongo_core::types::{Command, CoreEvent, FindSpec, BATCH_SIZE};
 use tokio::time::timeout;
 
 /// Receive the next non-Ping event (health pings can arrive at any time).
@@ -22,14 +23,25 @@ async fn recv(rx: &mut tokio::sync::mpsc::Receiver<CoreEvent>) -> CoreEvent {
     }
 }
 
+fn test_uri() -> Option<String> {
+    std::env::var("LAZYMONGO_TEST_URI").ok()
+}
+
+fn spec(filter: &str) -> FindSpec {
+    FindSpec {
+        filter: parse_filter(filter).unwrap(),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn browse_and_query_flow() {
-    let Ok(uri) = std::env::var("LAZYMONGO_TEST_URI") else {
+    let Some(uri) = test_uri() else {
         eprintln!("LAZYMONGO_TEST_URI not set; skipping integration test");
         return;
     };
 
-    let (cmd, mut evt) = actor::spawn();
+    let (cmd, mut evt) = actor::spawn(false);
     cmd.send(Command::Connect { uri }).await.unwrap();
     match recv(&mut evt).await {
         CoreEvent::Connected { server_version, .. } => {
@@ -73,7 +85,7 @@ async fn browse_and_query_flow() {
         generation: 1,
         db: "app_db".into(),
         coll: "users".into(),
-        filter: parse_filter("").unwrap(),
+        spec: spec(""),
     })
     .await
     .unwrap();
@@ -102,7 +114,6 @@ async fn browse_and_query_flow() {
                     .await
                     .unwrap();
             }
-            CoreEvent::Ping { .. } => continue,
             other => panic!("expected Batch, got {other:?}"),
         }
     }
@@ -119,7 +130,7 @@ async fn browse_and_query_flow() {
         generation: 2,
         db: "app_db".into(),
         coll: "users".into(),
-        filter: parse_filter("{ status: 'active', age: { $gt: 40 } }").unwrap(),
+        spec: spec("{ status: 'active', age: { $gt: 40 } }"),
     })
     .await
     .unwrap();
@@ -146,7 +157,6 @@ async fn browse_and_query_flow() {
                     .await
                     .unwrap();
             }
-            CoreEvent::Ping { .. } => continue,
             other => panic!("expected Batch, got {other:?}"),
         }
     }
@@ -154,4 +164,265 @@ async fn browse_and_query_flow() {
         filtered > 0 && filtered < 500,
         "unexpected filtered count {filtered}"
     );
+
+    // Full spec: projection + sort + limit + skip.
+    cmd.send(Command::StartFind {
+        generation: 3,
+        db: "app_db".into(),
+        coll: "users".into(),
+        spec: FindSpec {
+            filter: doc! {},
+            projection: Some(doc! { "name": 1, "age": 1 }),
+            sort: Some(doc! { "age": -1 }),
+            limit: Some(5),
+            skip: Some(2),
+        },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::Batch {
+            generation: 3,
+            docs,
+            exhausted,
+            ..
+        } => {
+            assert_eq!(docs.len(), 5);
+            assert!(exhausted);
+            let ages: Vec<i32> = docs.iter().map(|d| d.get_i32("age").unwrap()).collect();
+            assert!(
+                ages.windows(2).all(|w| w[0] >= w[1]),
+                "not sorted desc: {ages:?}"
+            );
+            assert!(docs[0].get("status").is_none(), "projection not applied");
+        }
+        other => panic!("expected Batch gen 3, got {other:?}"),
+    }
+
+    // Explain returns a query plan.
+    cmd.send(Command::Explain {
+        db: "app_db".into(),
+        coll: "users".into(),
+        spec: spec("{ age: { $gt: 30 } }"),
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::ExplainResult(plan) => {
+            assert!(plan.get_document("queryPlanner").is_ok(), "{plan:?}");
+        }
+        other => panic!("expected ExplainResult, got {other:?}"),
+    }
+
+    // Count for dry runs.
+    cmd.send(Command::Count {
+        req_id: 7,
+        db: "app_db".into(),
+        coll: "users".into(),
+        filter: parse_filter("{ status: 'active' }").unwrap(),
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::CountResult { req_id: 7, n } => assert!(n > 0 && n < 500),
+        other => panic!("expected CountResult, got {other:?}"),
+    }
+
+    // Aggregation preview, capped at limit.
+    cmd.send(Command::Aggregate {
+        generation: 4,
+        db: "app_db".into(),
+        coll: "users".into(),
+        pipeline: parse_pipeline(
+            "[{ $match: { status: 'active' } }, { $group: { _id: '$address.city', n: { $sum: 1 } } }, { $sort: { n: -1 } }]",
+        )
+        .unwrap(),
+        limit: 5,
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::AggBatch {
+            generation: 4,
+            docs,
+        } => {
+            assert!(!docs.is_empty() && docs.len() <= 5, "{docs:?}");
+            assert!(docs[0].get("n").is_some());
+        }
+        other => panic!("expected AggBatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn write_operations_roundtrip() {
+    let Some(uri) = test_uri() else {
+        return;
+    };
+    let (cmd, mut evt) = actor::spawn(false);
+    cmd.send(Command::Connect { uri }).await.unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
+
+    let db = "lazymongo_write_test".to_string();
+    let coll = "scratch".to_string();
+
+    // Start clean.
+    cmd.send(Command::DropCollection {
+        db: db.clone(),
+        coll: coll.clone(),
+    })
+    .await
+    .unwrap();
+    loop {
+        match recv(&mut evt).await {
+            CoreEvent::WriteDone { .. } => {}
+            CoreEvent::Collections { .. } => break,
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // Insert.
+    cmd.send(Command::InsertOne {
+        db: db.clone(),
+        coll: coll.clone(),
+        doc: doc! { "_id": 1, "kind": "test", "n": 1 },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::WriteDone {
+            summary, refresh, ..
+        } => {
+            assert!(summary.contains("inserted"), "{summary}");
+            assert!(refresh);
+        }
+        other => panic!("expected WriteDone, got {other:?}"),
+    }
+
+    // Replace by _id.
+    cmd.send(Command::ReplaceOne {
+        db: db.clone(),
+        coll: coll.clone(),
+        id: Bson::Int32(1),
+        doc: doc! { "kind": "test", "n": 2, "edited": true },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::WriteDone { summary, .. } => {
+            assert!(summary.contains("matched 1"), "{summary}")
+        }
+        other => panic!("expected WriteDone, got {other:?}"),
+    }
+
+    // UpdateMany.
+    cmd.send(Command::UpdateMany {
+        db: db.clone(),
+        coll: coll.clone(),
+        filter: doc! { "kind": "test" },
+        update: doc! { "$set": { "bulk": true } },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::WriteDone { summary, .. } => {
+            assert!(summary.contains("updated 1"), "{summary}")
+        }
+        other => panic!("expected WriteDone, got {other:?}"),
+    }
+
+    // Index create / list / drop.
+    cmd.send(Command::CreateIndex {
+        db: db.clone(),
+        coll: coll.clone(),
+        keys: doc! { "n": 1 },
+    })
+    .await
+    .unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::WriteDone { .. }));
+    let created = match recv(&mut evt).await {
+        CoreEvent::Indexes { indexes, .. } => {
+            assert!(indexes.iter().any(|i| i.name == "n_1"), "{indexes:?}");
+            "n_1".to_string()
+        }
+        other => panic!("expected Indexes, got {other:?}"),
+    };
+    cmd.send(Command::DropIndex {
+        db: db.clone(),
+        coll: coll.clone(),
+        name: created,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::WriteDone { .. }));
+    match recv(&mut evt).await {
+        CoreEvent::Indexes { indexes, .. } => {
+            assert!(!indexes.iter().any(|i| i.name == "n_1"))
+        }
+        other => panic!("expected Indexes, got {other:?}"),
+    }
+
+    // DeleteOne then DeleteMany.
+    cmd.send(Command::DeleteOne {
+        db: db.clone(),
+        coll: coll.clone(),
+        id: Bson::Int32(1),
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::WriteDone { summary, .. } => assert!(summary.contains("1 doc"), "{summary}"),
+        other => panic!("expected WriteDone, got {other:?}"),
+    }
+    cmd.send(Command::DeleteMany {
+        db: db.clone(),
+        coll: coll.clone(),
+        filter: doc! {},
+    })
+    .await
+    .unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::WriteDone { .. }));
+
+    // Clean up the scratch db's collection.
+    cmd.send(Command::DropCollection { db, coll })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn read_only_mode_rejects_writes() {
+    let Some(uri) = test_uri() else {
+        return;
+    };
+    let (cmd, mut evt) = actor::spawn(true);
+    cmd.send(Command::Connect { uri }).await.unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
+
+    cmd.send(Command::InsertOne {
+        db: "app_db".into(),
+        coll: "users".into(),
+        doc: doc! { "hax": true },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::Error(e) => assert!(e.contains("read-only"), "{e}"),
+        other => panic!("expected read-only Error, got {other:?}"),
+    }
+
+    // Reads still work.
+    cmd.send(Command::StartFind {
+        generation: 1,
+        db: "app_db".into(),
+        coll: "users".into(),
+        spec: FindSpec {
+            limit: Some(1),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::Batch { docs, .. } => assert_eq!(docs.len(), 1),
+        other => panic!("expected Batch, got {other:?}"),
+    }
 }

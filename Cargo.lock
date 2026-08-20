@@ -992,6 +992,7 @@ dependencies = [
  "anyhow",
  "lazymongo-core",
  "ratatui",
+ "serde_json",
  "tokio",
 ]
 

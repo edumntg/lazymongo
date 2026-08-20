@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, ConnState, ExplorerRow, Pane};
+use crate::app::{App, ConnState, ExplorerRow, Pane, ViewMode};
+use crate::modal::{DocView, Modal, QueryEditor, QUERY_FIELD_LABELS};
+use crate::util;
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
@@ -42,10 +44,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_results(f, app, results);
     draw_query(f, app, query);
     draw_help_bar(f, app, help);
-
-    if app.help_open {
-        draw_help_overlay(f, f.area());
-    }
+    draw_modal(f, app);
 }
 
 fn spinner(app: &App) -> &'static str {
@@ -54,17 +53,27 @@ fn spinner(app: &App) -> &'static str {
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let sep = Span::styled("  •  ", Style::new().fg(Color::DarkGray));
-    let mut spans = vec![
-        Span::styled(
-            " lazymongo ",
+    let mut spans = vec![Span::styled(
+        " lazymongo ",
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.read_only {
+        spans.push(Span::styled(
+            " RO ",
             Style::new()
-                .fg(Color::Black)
-                .bg(Color::Green)
+                .fg(Color::White)
+                .bg(Color::Red)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(app.uri_display.clone(), Style::new().fg(Color::White)),
-    ];
+        ));
+    }
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        app.uri_display.clone(),
+        Style::new().fg(Color::White),
+    ));
     match &app.conn {
         ConnState::Connecting => {
             spans.push(sep.clone());
@@ -220,12 +229,15 @@ fn draw_explorer(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Pane::Results;
-    let title = match &app.results.target {
+fn results_title(app: &App) -> String {
+    match &app.results.target {
         None => " 2 Results ".to_string(),
         Some((db, coll)) => {
-            let mut t = format!(" 2 Results ─ {db}.{coll} ");
+            let view = match app.view {
+                ViewMode::Json => "json",
+                ViewMode::Table => "table",
+            };
+            let mut t = format!(" 2 Results ─ {db}.{coll} [{view}] ");
             if let Some(total) = app.results.total_estimate {
                 t.push_str(&format!("~{} docs ", human_count(total)));
             }
@@ -250,11 +262,15 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
             }
             t
         }
-    };
+    }
+}
+
+fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.focus == Pane::Results;
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(focused_style(focused))
-        .title(title);
+        .title(results_title(app));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -274,6 +290,13 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    match app.view {
+        ViewMode::Json => draw_results_json(f, app, inner, focused),
+        ViewMode::Table => draw_results_table(f, app, inner, focused),
+    }
+}
+
+fn draw_results_json(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
     let height = inner.height as usize;
     let len = app.results.lines.len();
 
@@ -313,20 +336,154 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+fn pad_cell(s: &str, width: u16) -> String {
+    let w = width as usize;
+    let mut out: String = s.chars().take(w).collect();
+    if s.chars().count() > w && w > 1 {
+        out.truncate(out.chars().count().saturating_sub(1));
+        let mut truncated: String = out.chars().take(w - 1).collect();
+        truncated.push('…');
+        out = truncated;
+    }
+    let pad = w.saturating_sub(out.chars().count());
+    out.push_str(&" ".repeat(pad));
+    out
+}
+
+fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
+    let height = inner.height.saturating_sub(1) as usize; // header
+    let rows = app.results.docs.len();
+    let t = &mut app.results.table;
+
+    // Keep selected row visible.
+    if t.row < t.scroll_row {
+        t.scroll_row = t.row;
+    } else if height > 0 && t.row >= t.scroll_row + height {
+        t.scroll_row = t.row - height + 1;
+    }
+    t.scroll_row = t.scroll_row.min(rows.saturating_sub(1));
+
+    // Keep active column visible: advance col_offset until it fits.
+    t.col_offset = t.col_offset.min(t.active_col);
+    loop {
+        let mut x = 0u16;
+        let mut fits = false;
+        for i in t.col_offset..t.columns.len() {
+            let w = t.widths[i] + 1;
+            if i == t.active_col && x + w <= inner.width {
+                fits = true;
+            }
+            x += w;
+            if x > inner.width {
+                break;
+            }
+        }
+        if fits || t.col_offset >= t.active_col {
+            break;
+        }
+        t.col_offset += 1;
+    }
+
+    // Header + hit ranges.
+    t.col_hit.clear();
+    let sort = app.results.active_spec.sort.clone();
+    let mut header_spans: Vec<Span> = Vec::new();
+    let mut x = inner.x;
+    for i in t.col_offset..t.columns.len() {
+        let w = t.widths[i];
+        if x + w >= inner.x + inner.width {
+            break;
+        }
+        let col = &t.columns[i];
+        let arrow = match sort.as_ref().and_then(|s| s.get_i32(col.as_str()).ok()) {
+            Some(1) => "↑",
+            Some(-1) => "↓",
+            _ => "",
+        };
+        let label = pad_cell(&format!("{col}{arrow}"), w);
+        let style = if i == t.active_col && focused {
+            Style::new()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        };
+        header_spans.push(Span::styled(label, style));
+        header_spans.push(Span::raw(" "));
+        t.col_hit.push((x, x + w + 1, i));
+        x += w + 1;
+    }
+    let mut lines: Vec<Line> = vec![Line::from(header_spans)];
+
+    // Rows.
+    for (ri, doc) in app
+        .results
+        .docs
+        .iter()
+        .enumerate()
+        .skip(app.results.table.scroll_row)
+        .take(height)
+    {
+        let t = &app.results.table;
+        let mut spans: Vec<Span> = Vec::new();
+        let mut x = inner.x;
+        for i in t.col_offset..t.columns.len() {
+            let w = t.widths[i];
+            if x + w >= inner.x + inner.width {
+                break;
+            }
+            let cell = doc
+                .get(&t.columns[i])
+                .map(util::bson_to_compact)
+                .unwrap_or_default();
+            let style = if i == t.active_col && focused {
+                Style::new().fg(Color::White)
+            } else {
+                Style::new().fg(Color::Gray)
+            };
+            spans.push(Span::styled(pad_cell(&cell, w), style));
+            spans.push(Span::raw(" "));
+            x += w + 1;
+        }
+        let mut line = Line::from(spans);
+        if ri == t.row {
+            line.style = Style::new().bg(if focused {
+                Color::Blue
+            } else {
+                Color::DarkGray
+            });
+        }
+        lines.push(line);
+    }
+    if rows == 0 && !app.results.loading {
+        lines.push(Line::from(Span::styled(
+            "  no documents match",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
 fn draw_query(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Pane::Query;
-    let title = match &app.query.error {
-        Some(e) => Line::from(vec![
+    let mut title_spans = vec![Span::raw(" 3 Query (find filter) ")];
+    if !app.extras.is_default() {
+        title_spans.push(Span::styled(
+            "+projection/sort/limit — F to edit ",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    if let Some(e) = &app.query.error {
+        title_spans = vec![
             Span::raw(" 3 Query ─ "),
             Span::styled(e.clone(), Style::new().fg(Color::Red)),
             Span::raw(" "),
-        ]),
-        None => Line::raw(" 3 Query (find filter) "),
-    };
+        ];
+    }
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(focused_style(focused))
-        .title(title);
+        .title(Line::from(title_spans));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -357,34 +514,62 @@ fn draw_query(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
-    let entries: &[(&str, &str)] = match app.focus {
-        Pane::Explorer if app.explorer.filtering => {
-            &[("type", "filter"), ("↵", "apply"), ("esc", "clear")]
+    let entries: &[(&str, &str)] = if app.modal.is_open() {
+        match &app.modal {
+            Modal::DocView(_) => &[
+                ("↑↓/jk", "move"),
+                ("↵", "fold"),
+                ("y", "copy"),
+                ("esc", "close"),
+            ],
+            Modal::QueryEditor(_) => &[("tab/↑↓", "field"), ("↵", "run"), ("esc", "cancel")],
+            _ => &[("any key", "close")],
         }
-        Pane::Explorer => &[
-            ("↑↓/jk", "move"),
-            ("↵", "expand/open"),
-            ("/", "filter"),
-            ("r", "refresh"),
-            ("tab", "pane"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        Pane::Results => &[
-            ("↑↓/jk", "move"),
-            ("↵", "fold"),
-            ("^d/^u", "half-page"),
-            ("g/G", "top/end"),
-            ("3", "query"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        Pane::Query => &[
-            ("↵", "run"),
-            ("↑↓", "history"),
-            ("esc", "back"),
-            ("^c", "quit"),
-        ],
+    } else {
+        match app.focus {
+            Pane::Explorer if app.explorer.filtering => {
+                &[("type", "filter"), ("↵", "apply"), ("esc", "clear")]
+            }
+            Pane::Explorer => &[
+                ("↑↓/jk", "move"),
+                ("↵", "expand/open"),
+                ("/", "filter"),
+                ("r", "refresh"),
+                ("tab", "pane"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Pane::Results => match app.view {
+                ViewMode::Json => &[
+                    ("↑↓/jk", "move"),
+                    ("↵", "fold"),
+                    ("v", "table"),
+                    ("o", "doc"),
+                    ("F", "query"),
+                    ("x", "explain"),
+                    ("y", "copy"),
+                    ("E", "export"),
+                    ("?", "help"),
+                ],
+                ViewMode::Table => &[
+                    ("↑↓", "row"),
+                    ("←→", "column"),
+                    ("s", "sort"),
+                    ("↵", "open doc"),
+                    ("v", "json"),
+                    ("F", "query"),
+                    ("E", "csv"),
+                    ("?", "help"),
+                ],
+            },
+            Pane::Query => &[
+                ("↵", "run"),
+                ("↑↓", "history"),
+                ("F", "full editor"),
+                ("esc", "back"),
+                ("^c", "quit"),
+            ],
+        }
     };
     let mut spans = Vec::new();
     for (key, desc) in entries {
@@ -400,18 +585,115 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    let w = 62.min(area.width.saturating_sub(4));
-    let h = 24.min(area.height.saturating_sub(2));
-    let popup = Rect {
+// ---------- modals ----------
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width.saturating_sub(2));
+    let h = height.min(area.height.saturating_sub(2));
+    Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
-    };
+    }
+}
+
+fn draw_modal(f: &mut Frame, app: &mut App) {
+    match &mut app.modal {
+        Modal::None => {}
+        Modal::Help => draw_help_overlay(f, f.area()),
+        Modal::QueryEditor(editor) => draw_query_editor(f, f.area(), editor),
+        Modal::DocView(view) => draw_doc_view(f, f.area(), view),
+    }
+}
+
+fn draw_query_editor(f: &mut Frame, area: Rect, editor: &QueryEditor) {
+    let popup = centered(area, 72, 11);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(" Query editor ─ ↵ run · esc cancel ");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, field) in editor.fields.iter().enumerate() {
+        let focused = i == editor.focus;
+        let label_style = if focused {
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Cyan)
+        };
+        let mut spans = vec![Span::styled(
+            format!(" {:<11}", QUERY_FIELD_LABELS[i]),
+            label_style,
+        )];
+        spans.extend(field.spans(focused));
+        lines.push(Line::from(spans));
+        lines.push(Line::raw(""));
+    }
+    if let Some(e) = &editor.error {
+        lines.push(Line::from(Span::styled(
+            format!(" {e}"),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn draw_doc_view(f: &mut Frame, area: Rect, view: &mut DocView) {
+    let popup = centered(
+        area,
+        area.width.saturating_sub(8),
+        area.height.saturating_sub(4),
+    );
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(format!(" {} ", view.title));
+    let mut inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if let Some(warn) = &view.warn {
+        let warn_area = Rect { height: 1, ..inner };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" ⚠ {warn}"),
+                Style::new().fg(Color::White).bg(Color::Red),
+            ))),
+            warn_area,
+        );
+        inner.y += 1;
+        inner.height = inner.height.saturating_sub(1);
+    }
+
+    let height = inner.height as usize;
+    let len = view.lines.len();
+    if view.cursor < view.scroll {
+        view.scroll = view.cursor;
+    } else if height > 0 && view.cursor >= view.scroll + height {
+        view.scroll = view.cursor - height + 1;
+    }
+    view.scroll = view.scroll.min(len.saturating_sub(1));
+
+    let mut lines: Vec<Line> = Vec::with_capacity(height);
+    for (i, rline) in view.lines.iter().enumerate().skip(view.scroll).take(height) {
+        let mut line = rline.line.clone();
+        if i == view.cursor {
+            line.style = Style::new().bg(Color::Blue);
+        }
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
+    let popup = centered(area, 66, 30);
     f.render_widget(Clear, popup);
 
-    let key = |k: &str| Span::styled(format!("  {k:<12}"), Style::new().fg(Color::Cyan));
+    let key = |k: &str| Span::styled(format!("  {k:<14}"), Style::new().fg(Color::Cyan));
     let txt = |t: &str| Span::styled(t.to_string(), Style::new().fg(Color::White));
     let head = |t: &str| {
         Line::from(Span::styled(
@@ -422,31 +704,39 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     let lines = vec![
         head("Global"),
         Line::from(vec![key("q / ctrl-c"), txt("quit")]),
-        Line::from(vec![key("tab / S-tab"), txt("cycle panes")]),
-        Line::from(vec![key("1 2 3"), txt("jump to pane")]),
+        Line::from(vec![key("tab / 1 2 3"), txt("switch pane")]),
         Line::from(vec![key("r"), txt("refresh current pane")]),
         Line::from(vec![key("?"), txt("toggle this help")]),
         Line::raw(""),
         head("Explorer"),
-        Line::from(vec![key("↑↓ / j k"), txt("move")]),
         Line::from(vec![key("↵ / → / l"), txt("expand db · open collection")]),
-        Line::from(vec![key("← / h"), txt("collapse")]),
         Line::from(vec![key("/"), txt("filter databases & collections")]),
         Line::raw(""),
-        head("Results"),
-        Line::from(vec![key("↑↓ / j k"), txt("move line (auto-loads more)")]),
+        head("Results (both views)"),
+        Line::from(vec![key("v"), txt("toggle json / table view")]),
+        Line::from(vec![
+            key("F"),
+            txt("query editor (projection/sort/limit/skip)"),
+        ]),
+        Line::from(vec![key("x"), txt("explain query plan")]),
+        Line::from(vec![key("o"), txt("open document full-screen")]),
+        Line::from(vec![key("y"), txt("copy document to clipboard")]),
+        Line::from(vec![key("E"), txt("export loaded docs (json / csv)")]),
+        Line::raw(""),
+        head("Results · json view"),
         Line::from(vec![key("↵ / space"), txt("fold / unfold at cursor")]),
-        Line::from(vec![key("^d ^u pgup/dn"), txt("scroll pages")]),
-        Line::from(vec![key("g / G"), txt("first / last line")]),
+        Line::from(vec![key("^d ^u g G"), txt("scroll / jump")]),
         Line::raw(""),
-        head("Query"),
-        Line::from(vec![key("↵"), txt("run filter (mongosh syntax ok)")]),
-        Line::from(vec![key("↑ / ↓"), txt("history")]),
+        head("Results · table view"),
+        Line::from(vec![key("← → / h l"), txt("select column")]),
+        Line::from(vec![key("s / click header"), txt("server sort by column")]),
+        Line::from(vec![key("↵"), txt("open row as document")]),
         Line::raw(""),
-        Line::from(Span::styled(
-            " Mouse: click to focus/select/open, wheel to scroll.",
-            Style::new().fg(Color::DarkGray),
-        )),
+        head("Query bar"),
+        Line::from(vec![
+            key("↵ · ↑↓"),
+            txt("run filter (mongosh syntax) · history"),
+        ]),
     ];
     let block = Block::bordered()
         .border_type(BorderType::Rounded)

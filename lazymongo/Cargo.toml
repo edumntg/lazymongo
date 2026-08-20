@@ -10,4 +10,5 @@ description = "A fast, lightweight terminal UI for MongoDB"
 lazymongo-core = { path = "../lazymongo-core" }
 anyhow.workspace = true
 tokio.workspace = true
+serde_json.workspace = true
 ratatui = "0.29"

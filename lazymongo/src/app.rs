@@ -7,26 +7,38 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use lazymongo_core::actor;
 use lazymongo_core::bson::Document;
-use lazymongo_core::query::parse_filter;
-use lazymongo_core::types::{CollectionInfo, Command, CoreEvent, DatabaseInfo, BATCH_SIZE};
+use lazymongo_core::query::{parse_filter, parse_optional_doc};
+use lazymongo_core::types::{
+    CollectionInfo, Command, CoreEvent, DatabaseInfo, FindSpec, BATCH_SIZE,
+};
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
 use tokio::sync::mpsc;
 
+use crate::input::char_to_byte;
 use crate::json_view::{doc_lines, RLine};
-use crate::{event, term, ui};
+use crate::modal::{DocView, Modal, QueryEditor};
+use crate::{event, term, ui, util};
 
 /// Memory cap: max documents held in the sliding window (NFR-3).
 pub const MAX_DOCS: usize = 2000;
 const TOAST_TTL: Duration = Duration::from_secs(4);
+/// Max columns inferred for the table view (FR-22).
+const MAX_TABLE_COLS: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Explorer,
     Results,
     Query,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Json,
+    Table,
 }
 
 pub enum ConnState {
@@ -87,6 +99,59 @@ impl Explorer {
     }
 }
 
+/// Table view state (FR-22). Column x-ranges are filled in at render time
+/// for mouse hit-testing.
+#[derive(Default)]
+pub struct TableView {
+    pub columns: Vec<String>,
+    pub widths: Vec<u16>,
+    pub active_col: usize,
+    pub row: usize,
+    pub scroll_row: usize,
+    pub col_offset: usize,
+    /// (x_start, x_end, column index) of visible columns, from last render.
+    pub col_hit: Vec<(u16, u16, usize)>,
+}
+
+impl TableView {
+    fn recompute(&mut self, docs: &[Document]) {
+        let mut columns: Vec<String> = Vec::new();
+        for doc in docs {
+            for key in doc.keys() {
+                if !columns.iter().any(|c| c == key) {
+                    columns.push(key.clone());
+                    if columns.len() >= MAX_TABLE_COLS {
+                        break;
+                    }
+                }
+            }
+            if columns.len() >= MAX_TABLE_COLS {
+                break;
+            }
+        }
+        // _id first when present.
+        if let Some(pos) = columns.iter().position(|c| c == "_id") {
+            let id = columns.remove(pos);
+            columns.insert(0, id);
+        }
+        let mut widths: Vec<u16> = columns
+            .iter()
+            .map(|c| c.chars().count().clamp(4, 30) as u16)
+            .collect();
+        for doc in docs.iter().take(200) {
+            for (i, col) in columns.iter().enumerate() {
+                if let Some(v) = doc.get(col) {
+                    let w = util::bson_to_compact(v).chars().count().clamp(4, 30) as u16;
+                    widths[i] = widths[i].max(w);
+                }
+            }
+        }
+        self.columns = columns;
+        self.widths = widths;
+        self.active_col = self.active_col.min(self.columns.len().saturating_sub(1));
+    }
+}
+
 #[derive(Default)]
 pub struct Results {
     /// (db, collection) currently open.
@@ -104,8 +169,9 @@ pub struct Results {
     pub total_estimate: Option<u64>,
     /// Documents evicted from the front of the window.
     pub evicted: u64,
-    /// Filter used for the active find (already parsed).
-    pub active_filter: Document,
+    /// Spec used for the active find (already parsed).
+    pub active_spec: FindSpec,
+    pub table: TableView,
 }
 
 impl Results {
@@ -116,6 +182,8 @@ impl Results {
             self.lines.extend(doc_lines(i, number, doc, &self.folds[i]));
         }
         self.cursor = self.cursor.min(self.lines.len().saturating_sub(1));
+        self.table.recompute(&self.docs);
+        self.table.row = self.table.row.min(self.docs.len().saturating_sub(1));
         self.dirty = false;
     }
 }
@@ -129,14 +197,35 @@ pub struct QueryBar {
     pub error: Option<String>,
 }
 
+/// The non-filter parts of the find spec, kept as user-entered strings.
+#[derive(Default, Clone)]
+pub struct SpecExtras {
+    pub projection: String,
+    pub sort: String,
+    pub limit: String,
+    pub skip: String,
+}
+
+impl SpecExtras {
+    pub fn is_default(&self) -> bool {
+        self.projection.trim().is_empty()
+            && self.sort.trim().is_empty()
+            && self.limit.trim().is_empty()
+            && self.skip.trim().is_empty()
+    }
+}
+
 pub struct App {
     pub conn: ConnState,
     pub uri_display: String,
+    pub read_only: bool,
     pub focus: Pane,
+    pub view: ViewMode,
     pub explorer: Explorer,
     pub results: Results,
     pub query: QueryBar,
-    pub help_open: bool,
+    pub extras: SpecExtras,
+    pub modal: Modal,
     pub toast: Option<(String, bool, Instant)>, // (message, is_error, when)
     pub spinner_frame: usize,
     pub should_quit: bool,
@@ -149,15 +238,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(uri_display: String, cmd_tx: mpsc::Sender<Command>) -> Self {
+    pub fn new(uri_display: String, cmd_tx: mpsc::Sender<Command>, read_only: bool) -> Self {
         Self {
             conn: ConnState::Connecting,
             uri_display,
+            read_only,
             focus: Pane::Explorer,
+            view: ViewMode::Json,
             explorer: Explorer::default(),
             results: Results::default(),
             query: QueryBar::default(),
-            help_open: false,
+            extras: SpecExtras::default(),
+            modal: Modal::None,
             toast: None,
             spinner_frame: 0,
             should_quit: false,
@@ -169,17 +261,17 @@ impl App {
         }
     }
 
-    fn send(&mut self, cmd: Command) {
+    pub fn send(&mut self, cmd: Command) {
         if self.cmd_tx.try_send(cmd).is_err() {
             self.toast_err("busy: command queue full, try again".into());
         }
     }
 
-    fn toast_err(&mut self, msg: String) {
+    pub fn toast_err(&mut self, msg: String) {
         self.toast = Some((msg, true, Instant::now()));
     }
 
-    fn toast_info(&mut self, msg: String) {
+    pub fn toast_info(&mut self, msg: String) {
         self.toast = Some((msg, false, Instant::now()));
     }
 
@@ -253,6 +345,15 @@ impl App {
                 }
                 self.results.dirty = true;
             }
+            CoreEvent::ExplainResult(plan) => {
+                let warn = if util::has_collscan(&plan) {
+                    Some("COLLSCAN: this query does a full collection scan (no index)".into())
+                } else {
+                    None
+                };
+                self.modal =
+                    Modal::DocView(DocView::new("Explain (executionStats)".into(), plan, warn));
+            }
             CoreEvent::Ping { ms } => {
                 if let ConnState::Connected { ping_ms, .. } = &mut self.conn {
                     *ping_ms = ms;
@@ -262,6 +363,11 @@ impl App {
                 self.results.loading = false;
                 self.toast_err(e);
             }
+            // Wired up with the write flows (M3) and aggregations (M4).
+            CoreEvent::WriteDone { summary, .. } => self.toast_info(summary),
+            CoreEvent::CountResult { .. }
+            | CoreEvent::Indexes { .. }
+            | CoreEvent::AggBatch { .. } => {}
         }
     }
 
@@ -290,9 +396,8 @@ impl App {
             self.should_quit = true;
             return;
         }
-        if self.help_open {
-            self.help_open = false;
-            return;
+        if self.modal.is_open() {
+            return self.on_key_modal(key);
         }
         // Text-input modes capture printable keys first.
         if self.focus == Pane::Query {
@@ -304,7 +409,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.help_open = true,
+            KeyCode::Char('?') => self.modal = Modal::Help,
             KeyCode::Tab => self.cycle_focus(false),
             KeyCode::BackTab => self.cycle_focus(true),
             KeyCode::Char('1') => self.focus = Pane::Explorer,
@@ -316,6 +421,91 @@ impl App {
                 Pane::Results => self.on_key_results(key),
                 Pane::Query => unreachable!(),
             },
+        }
+    }
+
+    // ---------- modals ----------
+
+    fn on_key_modal(&mut self, key: KeyEvent) {
+        match &mut self.modal {
+            Modal::None => {}
+            Modal::Help => self.modal = Modal::None,
+            Modal::DocView(view) => {
+                let page = 20usize;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        view.cursor = (view.cursor + 1).min(view.lines.len().saturating_sub(1))
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => view.cursor = view.cursor.saturating_sub(1),
+                    KeyCode::PageDown => {
+                        view.cursor = (view.cursor + page).min(view.lines.len().saturating_sub(1))
+                    }
+                    KeyCode::PageUp => view.cursor = view.cursor.saturating_sub(page),
+                    KeyCode::Char('g') | KeyCode::Home => view.cursor = 0,
+                    KeyCode::Char('G') | KeyCode::End => {
+                        view.cursor = view.lines.len().saturating_sub(1)
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => view.toggle_fold_at_cursor(),
+                    KeyCode::Char('y') => {
+                        let text = util::doc_to_pretty(&view.doc);
+                        match util::clipboard_copy(&text) {
+                            Ok(()) => self.toast_info("document copied".into()),
+                            Err(e) => self.toast_err(e),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Modal::QueryEditor(editor) => match key.code {
+                KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Tab | KeyCode::Down => editor.focus = (editor.focus + 1) % 5,
+                KeyCode::BackTab | KeyCode::Up => editor.focus = (editor.focus + 4) % 5,
+                KeyCode::Enter => self.submit_query_editor(),
+                _ => {
+                    editor.fields[editor.focus].on_key(key);
+                    editor.error = None;
+                }
+            },
+        }
+    }
+
+    fn open_query_editor(&mut self) {
+        if self.results.target.is_none() {
+            self.toast_err("select a collection first".into());
+            return;
+        }
+        self.modal = Modal::QueryEditor(QueryEditor::new(
+            &self.query.input,
+            &self.extras.projection,
+            &self.extras.sort,
+            &self.extras.limit,
+            &self.extras.skip,
+        ));
+    }
+
+    fn submit_query_editor(&mut self) {
+        let Modal::QueryEditor(editor) = &mut self.modal else {
+            return;
+        };
+        let texts: Vec<String> = editor.fields.iter().map(|f| f.text.clone()).collect();
+        match build_spec(&texts[0], &texts[1], &texts[2], &texts[3], &texts[4]) {
+            Err(e) => editor.error = Some(e),
+            Ok(spec) => {
+                self.query.input = texts[0].clone();
+                self.query.cursor = self.query.input.chars().count();
+                self.extras.projection = texts[1].clone();
+                self.extras.sort = texts[2].clone();
+                self.extras.limit = texts[3].clone();
+                self.extras.skip = texts[4].clone();
+                self.modal = Modal::None;
+                self.push_history();
+                let Some((db, coll)) = self.results.target.clone() else {
+                    return;
+                };
+                self.focus = Pane::Results;
+                self.start_find(db, coll, spec);
+            }
         }
     }
 
@@ -350,15 +540,15 @@ impl App {
         }
     }
 
-    fn rerun_find(&mut self) {
+    pub fn rerun_find(&mut self) {
         let Some((db, coll)) = self.results.target.clone() else {
             return;
         };
-        let filter = self.results.active_filter.clone();
-        self.start_find(db, coll, filter);
+        let spec = self.results.active_spec.clone();
+        self.start_find(db, coll, spec);
     }
 
-    fn start_find(&mut self, db: String, coll: String, filter: Document) {
+    fn start_find(&mut self, db: String, coll: String, spec: FindSpec) {
         self.generation += 1;
         let r = &mut self.results;
         r.target = Some((db.clone(), coll.clone()));
@@ -367,18 +557,20 @@ impl App {
         r.lines.clear();
         r.cursor = 0;
         r.scroll = 0;
+        r.table.row = 0;
+        r.table.scroll_row = 0;
         r.exhausted = false;
         r.loading = true;
         r.total_estimate = None;
         r.evicted = 0;
-        r.active_filter = filter.clone();
+        r.active_spec = spec.clone();
         r.dirty = true;
         let generation = self.generation;
         self.send(Command::StartFind {
             generation,
             db,
             coll,
-            filter,
+            spec,
         });
     }
 
@@ -472,15 +664,53 @@ impl App {
                 self.query.input.clear();
                 self.query.cursor = 0;
                 self.query.error = None;
+                self.extras = SpecExtras::default();
                 self.focus = Pane::Results;
-                self.start_find(db_name, coll_name, Document::new());
+                self.start_find(db_name, coll_name, FindSpec::default());
             }
         }
     }
 
     // ---------- results ----------
 
+    /// Index of the document under the cursor/selection in either view.
+    pub fn current_doc_idx(&self) -> Option<usize> {
+        match self.view {
+            ViewMode::Json => self
+                .results
+                .lines
+                .get(self.results.cursor)
+                .map(|l| l.doc_idx),
+            ViewMode::Table => {
+                (self.results.table.row < self.results.docs.len()).then_some(self.results.table.row)
+            }
+        }
+    }
+
     fn on_key_results(&mut self, key: KeyEvent) {
+        // View-independent actions first.
+        match key.code {
+            KeyCode::Char('v') => {
+                self.view = match self.view {
+                    ViewMode::Json => ViewMode::Table,
+                    ViewMode::Table => ViewMode::Json,
+                };
+                return;
+            }
+            KeyCode::Char('F') => return self.open_query_editor(),
+            KeyCode::Char('x') => return self.explain_current(),
+            KeyCode::Char('o') => return self.open_doc_view(),
+            KeyCode::Char('y') => return self.copy_current_doc(),
+            KeyCode::Char('E') => return self.export_results(),
+            _ => {}
+        }
+        match self.view {
+            ViewMode::Json => self.on_key_results_json(key),
+            ViewMode::Table => self.on_key_results_table(key),
+        }
+    }
+
+    fn on_key_results_json(&mut self, key: KeyEvent) {
         let len = self.results.lines.len();
         let page = self.results_area.height.saturating_sub(2) as usize; // borders
         match key.code {
@@ -506,6 +736,117 @@ impl App {
         }
     }
 
+    fn on_key_results_table(&mut self, key: KeyEvent) {
+        let rows = self.results.docs.len();
+        let page = self.results_area.height.saturating_sub(3) as usize; // borders + header
+        let t = &mut self.results.table;
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                t.row = (t.row + 1).min(rows.saturating_sub(1));
+                self.maybe_fetch_more();
+            }
+            KeyCode::Up | KeyCode::Char('k') => t.row = t.row.saturating_sub(1),
+            KeyCode::PageDown => {
+                t.row = (t.row + page).min(rows.saturating_sub(1));
+                self.maybe_fetch_more();
+            }
+            KeyCode::PageUp => t.row = t.row.saturating_sub(page),
+            KeyCode::Char('g') | KeyCode::Home => t.row = 0,
+            KeyCode::Char('G') | KeyCode::End => {
+                t.row = rows.saturating_sub(1);
+                self.maybe_fetch_more();
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                t.active_col = t.active_col.saturating_sub(1);
+                t.col_offset = t.col_offset.min(t.active_col);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                t.active_col = (t.active_col + 1).min(t.columns.len().saturating_sub(1));
+            }
+            KeyCode::Char('s') => self.toggle_sort_active_col(),
+            KeyCode::Enter => self.open_doc_view(),
+            _ => {}
+        }
+    }
+
+    /// Server-side sort on the table's active column (FR-22).
+    fn toggle_sort_active_col(&mut self) {
+        let t = &self.results.table;
+        let Some(col) = t.columns.get(t.active_col).cloned() else {
+            return;
+        };
+        let current = self
+            .results
+            .active_spec
+            .sort
+            .as_ref()
+            .and_then(|s| s.get_i32(&col).ok());
+        self.extras.sort = match current {
+            Some(1) => format!("{{ \"{col}\": -1 }}"),
+            Some(-1) => String::new(),
+            _ => format!("{{ \"{col}\": 1 }}"),
+        };
+        self.run_query();
+    }
+
+    fn open_doc_view(&mut self) {
+        let Some(idx) = self.current_doc_idx() else {
+            return;
+        };
+        let doc = self.results.docs[idx].clone();
+        let number = self.results.evicted + idx as u64 + 1;
+        let title = match &self.results.target {
+            Some((db, coll)) => format!("{db}.{coll} — doc {number}"),
+            None => format!("doc {number}"),
+        };
+        self.modal = Modal::DocView(DocView::new(title, doc, None));
+    }
+
+    fn explain_current(&mut self) {
+        let Some((db, coll)) = self.results.target.clone() else {
+            self.toast_err("select a collection first".into());
+            return;
+        };
+        self.toast_info("explaining…".into());
+        let spec = self.results.active_spec.clone();
+        self.send(Command::Explain { db, coll, spec });
+    }
+
+    fn copy_current_doc(&mut self) {
+        let Some(idx) = self.current_doc_idx() else {
+            return;
+        };
+        let text = util::doc_to_pretty(&self.results.docs[idx]);
+        match util::clipboard_copy(&text) {
+            Ok(()) => self.toast_info("document copied to clipboard".into()),
+            Err(e) => self.toast_err(e),
+        }
+    }
+
+    /// Export the loaded window: JSON array in JSON view, CSV in table view.
+    fn export_results(&mut self) {
+        let Some((db, coll)) = self.results.target.clone() else {
+            return;
+        };
+        if self.results.docs.is_empty() {
+            self.toast_err("nothing to export".into());
+            return;
+        }
+        let result = match self.view {
+            ViewMode::Json => util::export_json(&db, &coll, &self.results.docs),
+            ViewMode::Table => {
+                util::export_csv(&db, &coll, &self.results.table.columns, &self.results.docs)
+            }
+        };
+        match result {
+            Ok(path) => self.toast_info(format!(
+                "exported {} docs to {path}",
+                self.results.docs.len()
+            )),
+            Err(e) => self.toast_err(format!("export failed: {e}")),
+        }
+    }
+
     fn move_results_cursor(&mut self, delta: isize) {
         let len = self.results.lines.len();
         if len == 0 {
@@ -522,7 +863,10 @@ impl App {
         if r.loading || r.exhausted || r.target.is_none() {
             return;
         }
-        let near_end = r.cursor + 30 >= r.lines.len();
+        let near_end = match self.view {
+            ViewMode::Json => r.cursor + 30 >= r.lines.len(),
+            ViewMode::Table => r.table.row + 15 >= r.docs.len(),
+        };
         if near_end {
             self.results.loading = true;
             let generation = self.generation;
@@ -569,13 +913,29 @@ impl App {
     // ---------- query bar ----------
 
     fn on_key_query(&mut self, key: KeyEvent) {
-        let q = &mut self.query;
         match key.code {
             KeyCode::Esc => {
                 self.focus = Pane::Results;
-                q.error = None;
+                self.query.error = None;
+                return;
             }
-            KeyCode::Enter => self.run_query(),
+            KeyCode::Enter => {
+                self.push_history();
+                self.run_query();
+                return;
+            }
+            KeyCode::Tab => {
+                self.cycle_focus(false);
+                return;
+            }
+            KeyCode::BackTab => {
+                self.cycle_focus(true);
+                return;
+            }
+            _ => {}
+        }
+        let q = &mut self.query;
+        match key.code {
             KeyCode::Backspace => {
                 if q.cursor > 0 {
                     let idx = char_to_byte(&q.input, q.cursor - 1);
@@ -626,22 +986,32 @@ impl App {
         }
     }
 
+    fn push_history(&mut self) {
+        let text = self.query.input.trim().to_string();
+        if !text.is_empty() && self.query.history.last() != Some(&text) {
+            self.query.history.push(text);
+        }
+        self.query.hist_pos = None;
+    }
+
+    /// Run the current query bar filter + spec extras.
     fn run_query(&mut self) {
         let Some((db, coll)) = self.results.target.clone() else {
             self.toast_err("select a collection first".into());
             return;
         };
-        match parse_filter(&self.query.input) {
+        match build_spec(
+            &self.query.input,
+            &self.extras.projection,
+            &self.extras.sort,
+            &self.extras.limit,
+            &self.extras.skip,
+        ) {
             Err(e) => self.query.error = Some(e),
-            Ok(filter) => {
+            Ok(spec) => {
                 self.query.error = None;
-                let text = self.query.input.trim().to_string();
-                if !text.is_empty() && self.query.history.last() != Some(&text) {
-                    self.query.history.push(text);
-                }
-                self.query.hist_pos = None;
                 self.focus = Pane::Results;
-                self.start_find(db, coll, filter);
+                self.start_find(db, coll, spec);
             }
         }
     }
@@ -653,11 +1023,22 @@ impl App {
             x: m.column,
             y: m.row,
         };
+        if self.modal.is_open() {
+            match (&mut self.modal, m.kind) {
+                (Modal::Help, MouseEventKind::Down(_)) => self.modal = Modal::None,
+                (Modal::DocView(view), MouseEventKind::ScrollDown) => {
+                    view.scroll = (view.scroll + 3).min(view.lines.len().saturating_sub(1));
+                }
+                (Modal::DocView(view), MouseEventKind::ScrollUp) => {
+                    view.scroll = view.scroll.saturating_sub(3);
+                }
+                _ => {}
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.help_open {
-                    self.help_open = false;
-                } else if self.explorer_area.contains(pos) {
+                if self.explorer_area.contains(pos) {
                     self.focus = Pane::Explorer;
                     let row = (m.row.saturating_sub(self.explorer_area.y + 1)) as usize
                         + self.explorer.scroll;
@@ -668,14 +1049,19 @@ impl App {
                     }
                 } else if self.results_area.contains(pos) {
                     self.focus = Pane::Results;
-                    let line = (m.row.saturating_sub(self.results_area.y + 1)) as usize
-                        + self.results.scroll;
-                    if line < self.results.lines.len() {
-                        if self.results.cursor == line {
-                            self.toggle_fold_at_cursor();
-                        } else {
-                            self.results.cursor = line;
+                    match self.view {
+                        ViewMode::Json => {
+                            let line = (m.row.saturating_sub(self.results_area.y + 1)) as usize
+                                + self.results.scroll;
+                            if line < self.results.lines.len() {
+                                if self.results.cursor == line {
+                                    self.toggle_fold_at_cursor();
+                                } else {
+                                    self.results.cursor = line;
+                                }
+                            }
                         }
+                        ViewMode::Table => self.on_table_click(m),
                     }
                 } else if self.query_area.contains(pos) {
                     self.focus = Pane::Query;
@@ -687,28 +1073,87 @@ impl App {
         }
     }
 
+    fn on_table_click(&mut self, m: MouseEvent) {
+        let header_y = self.results_area.y + 1;
+        if m.row == header_y {
+            // Click on a column header: select it and toggle sort.
+            let hit = self
+                .results
+                .table
+                .col_hit
+                .iter()
+                .find(|(x0, x1, _)| m.column >= *x0 && m.column < *x1)
+                .map(|(_, _, i)| *i);
+            if let Some(i) = hit {
+                self.results.table.active_col = i;
+                self.toggle_sort_active_col();
+            }
+            return;
+        }
+        let row = (m.row.saturating_sub(header_y + 1)) as usize + self.results.table.scroll_row;
+        if row < self.results.docs.len() {
+            if self.results.table.row == row {
+                self.open_doc_view();
+            } else {
+                self.results.table.row = row;
+            }
+        }
+    }
+
     fn scroll_under_mouse(&mut self, pos: Position, delta: isize) {
         if self.explorer_area.contains(pos) {
             let n = self.explorer.rows().len();
             let s = self.explorer.scroll as isize + delta;
             self.explorer.scroll = s.clamp(0, n.saturating_sub(1) as isize) as usize;
         } else if self.results_area.contains(pos) {
-            let n = self.results.lines.len();
-            let s = self.results.scroll as isize + delta;
-            self.results.scroll = s.clamp(0, n.saturating_sub(1) as isize) as usize;
-            // Scrolling near the bottom also triggers the next batch.
-            if self.results.scroll + (self.results_area.height as usize) + 10 >= n {
-                self.maybe_fetch_more();
+            match self.view {
+                ViewMode::Json => {
+                    let n = self.results.lines.len();
+                    let s = self.results.scroll as isize + delta;
+                    self.results.scroll = s.clamp(0, n.saturating_sub(1) as isize) as usize;
+                    if self.results.scroll + (self.results_area.height as usize) + 10 >= n {
+                        self.maybe_fetch_more();
+                    }
+                }
+                ViewMode::Table => {
+                    let n = self.results.docs.len();
+                    let s = self.results.table.scroll_row as isize + delta;
+                    self.results.table.scroll_row =
+                        s.clamp(0, n.saturating_sub(1) as isize) as usize;
+                    if self.results.table.scroll_row + (self.results_area.height as usize) + 10 >= n
+                    {
+                        self.maybe_fetch_more();
+                    }
+                }
             }
         }
     }
 }
 
-fn char_to_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
+/// Build a FindSpec from user-entered strings.
+fn build_spec(
+    filter: &str,
+    projection: &str,
+    sort: &str,
+    limit: &str,
+    skip: &str,
+) -> Result<FindSpec, String> {
+    let parse_num = |s: &str, what: &str| -> Result<Option<i64>, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        s.parse::<i64>()
+            .map(Some)
+            .map_err(|_| format!("{what} must be an integer"))
+    };
+    Ok(FindSpec {
+        filter: parse_filter(filter)?,
+        projection: parse_optional_doc(projection).map_err(|e| format!("projection: {e}"))?,
+        sort: parse_optional_doc(sort).map_err(|e| format!("sort: {e}"))?,
+        limit: parse_num(limit, "limit")?,
+        skip: parse_num(skip, "skip")?.map(|n| n.max(0) as u64),
+    })
 }
 
 /// Strip credentials from a connection string for display.
@@ -723,10 +1168,10 @@ pub fn redact_uri(uri: &str) -> String {
 }
 
 /// Main event loop: draw, then wait for the next input/core/tick event.
-pub async fn run(terminal: &mut term::Term, uri: String) -> Result<()> {
-    let (cmd_tx, mut core_rx) = actor::spawn();
+pub async fn run(terminal: &mut term::Term, uri: String, read_only: bool) -> Result<()> {
+    let (cmd_tx, mut core_rx) = actor::spawn(read_only);
     let mut input_rx = event::input_channel();
-    let mut app = App::new(redact_uri(&uri), cmd_tx);
+    let mut app = App::new(redact_uri(&uri), cmd_tx, read_only);
     app.send(Command::Connect { uri });
 
     let mut tick = tokio::time::interval(Duration::from_millis(250));
