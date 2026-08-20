@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::types::{
     pipeline_writes, CollectionInfo, Command, CoreEvent, DatabaseInfo, FindSpec, IndexInfo,
-    BATCH_SIZE,
+    BATCH_SIZE, FIRST_BATCH_SIZE,
 };
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
@@ -20,8 +20,11 @@ const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Server-side guardrails (FR-16).
 const FIND_MAX_TIME: Duration = Duration::from_secs(30);
 const COUNT_MAX_TIME: Duration = Duration::from_secs(15);
-/// Concurrent estimated-count commands while filling the sidebar.
-const COUNT_CONCURRENCY: usize = 10;
+/// Concurrent estimated-count commands while filling the sidebar. Kept well
+/// below the pool size so interactive queries never wait for a connection.
+const COUNT_CONCURRENCY: usize = 4;
+/// Driver pool size (default is 10, which background counts could exhaust).
+const MAX_POOL_SIZE: u32 = 20;
 
 /// Spawn the actor on the current tokio runtime.
 /// `read_only` rejects every write command at the I/O layer (FR-4).
@@ -175,6 +178,7 @@ impl Actor {
             let mut opts = ClientOptions::parse(&uri).await?;
             opts.app_name = Some("lazymongo".into());
             opts.server_selection_timeout = Some(SERVER_SELECTION_TIMEOUT);
+            opts.max_pool_size = Some(MAX_POOL_SIZE);
             let client = Client::with_options(opts)?;
 
             let admin = client.database("admin");
@@ -306,11 +310,22 @@ impl Actor {
         self.cursor = None;
 
         let collection = self.coll(&db, &coll);
-        let total_estimate = if spec.filter.is_empty() && spec.limit.is_none() {
-            collection.estimated_document_count().await.ok()
-        } else {
-            None
-        };
+        // The estimate is cosmetic (title bar): compute it in the background
+        // so it never delays the first batch.
+        if spec.filter.is_empty() && spec.limit.is_none() {
+            let events = self.events.clone();
+            let counted = collection.clone();
+            tokio::spawn(async move {
+                if let Ok(estimate) = counted.estimated_document_count().await {
+                    let _ = events
+                        .send(CoreEvent::TotalEstimate {
+                            generation,
+                            estimate,
+                        })
+                        .await;
+                }
+            });
+        }
 
         let mut find = collection
             .find(spec.filter)
@@ -338,7 +353,8 @@ impl Actor {
             None => Self::emit(&self.events, CoreEvent::Cancelled { generation }).await,
             Some(Ok(cursor)) => {
                 self.cursor = Some(cursor);
-                self.pull_batch(generation, total_estimate).await;
+                // Small first pull: paint the screen as soon as possible.
+                self.pull_batch(generation, FIRST_BATCH_SIZE).await;
             }
             Some(Err(e)) => Self::emit_err(&self.events, format!("find: {e}")).await,
         }
@@ -348,15 +364,15 @@ impl Actor {
         if generation != self.generation {
             return; // stale request from a superseded query
         }
-        self.pull_batch(generation, None).await;
+        self.pull_batch(generation, BATCH_SIZE).await;
     }
 
-    async fn pull_batch(&mut self, generation: u64, total_estimate: Option<u64>) {
+    async fn pull_batch(&mut self, generation: u64, target: usize) {
         let mut cancel = self.cancel_rx.clone();
         let Some(cursor) = &mut self.cursor else {
             return;
         };
-        let mut docs = Vec::with_capacity(BATCH_SIZE);
+        let mut docs = Vec::with_capacity(target);
         let mut exhausted = false;
         loop {
             let item = tokio::select! {
@@ -370,7 +386,7 @@ impl Actor {
             match item {
                 Ok(Some(doc)) => {
                     docs.push(doc);
-                    if docs.len() >= BATCH_SIZE {
+                    if docs.len() >= target {
                         break;
                     }
                 }
@@ -393,7 +409,6 @@ impl Actor {
                 generation,
                 docs,
                 exhausted,
-                total_estimate,
             },
         )
         .await;

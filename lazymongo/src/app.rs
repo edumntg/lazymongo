@@ -384,20 +384,24 @@ impl App {
                     }
                 }
             }
+            CoreEvent::TotalEstimate {
+                generation,
+                estimate,
+            } => {
+                if generation == self.generation {
+                    self.results.total_estimate = Some(estimate);
+                }
+            }
             CoreEvent::Batch {
                 generation,
                 docs,
                 exhausted,
-                total_estimate,
             } => {
                 if generation != self.generation {
                     return; // stale query
                 }
                 self.results.loading = false;
                 self.results.exhausted = exhausted;
-                if let Some(t) = total_estimate {
-                    self.results.total_estimate = Some(t);
-                }
                 for _ in 0..docs.len() {
                     let mut collapsed = HashSet::new();
                     collapsed.insert(String::new()); // docs arrive collapsed
@@ -418,6 +422,13 @@ impl App {
                     ));
                 }
                 self.results.dirty = true;
+                // The first batch is intentionally tiny for instant paint;
+                // top it up to a full page in the background.
+                if !self.results.exhausted && self.results.docs.len() < BATCH_SIZE {
+                    self.results.loading = true;
+                    let generation = self.generation;
+                    self.send(Command::NextBatch { generation });
+                }
             }
             CoreEvent::ExplainResult(plan) => {
                 let warn = if util::has_collscan(&plan) {

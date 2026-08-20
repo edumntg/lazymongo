@@ -2,6 +2,9 @@ use mongodb::bson::{Bson, Document};
 
 /// Number of documents fetched per batch.
 pub const BATCH_SIZE: usize = 50;
+/// The first batch is small so the first paint is instant even when
+/// documents are large or the link is slow.
+pub const FIRST_BATCH_SIZE: usize = 10;
 
 #[derive(Debug, Clone)]
 pub struct DatabaseInfo {
@@ -178,8 +181,12 @@ pub enum CoreEvent {
         docs: Vec<Document>,
         /// True when the cursor is exhausted (no more batches).
         exhausted: bool,
-        /// Estimated total (only for unfiltered finds), sent with batch 0.
-        total_estimate: Option<u64>,
+    },
+    /// Estimated total for an unfiltered find; computed in the background so
+    /// it never delays the first batch.
+    TotalEstimate {
+        generation: u64,
+        estimate: u64,
     },
     /// Aggregation preview results (one shot).
     AggBatch {

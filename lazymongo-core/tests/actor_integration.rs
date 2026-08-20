@@ -7,12 +7,11 @@ use std::time::Duration;
 use lazymongo_core::actor;
 use lazymongo_core::bson::{doc, Bson};
 use lazymongo_core::query::{parse_filter, parse_pipeline};
-use lazymongo_core::types::{Command, CoreEvent, FindSpec, BATCH_SIZE};
+use lazymongo_core::types::{Command, CoreEvent, FindSpec, BATCH_SIZE, FIRST_BATCH_SIZE};
 use tokio::time::timeout;
 
-/// Receive the next event, skipping background noise: health pings and the
-/// asynchronously streamed collection counts.
-async fn recv(rx: &mut tokio::sync::mpsc::Receiver<CoreEvent>) -> CoreEvent {
+/// Receive the next event, skipping pings and streamed collection counts.
+async fn recv_any(rx: &mut tokio::sync::mpsc::Receiver<CoreEvent>) -> CoreEvent {
     loop {
         let ev = timeout(Duration::from_secs(10), rx.recv())
             .await
@@ -22,6 +21,16 @@ async fn recv(rx: &mut tokio::sync::mpsc::Receiver<CoreEvent>) -> CoreEvent {
             ev,
             CoreEvent::Ping { .. } | CoreEvent::CollectionCount { .. }
         ) {
+            return ev;
+        }
+    }
+}
+
+/// Like [`recv_any`] but also skips background total estimates.
+async fn recv(rx: &mut tokio::sync::mpsc::Receiver<CoreEvent>) -> CoreEvent {
+    loop {
+        let ev = recv_any(rx).await;
+        if !matches!(ev, CoreEvent::TotalEstimate { .. }) {
             return ev;
         }
     }
@@ -172,18 +181,22 @@ async fn browse_and_query_flow() {
 
     let mut total = 0usize;
     let mut batches = 0usize;
+    let mut estimate = None;
     loop {
-        match recv(&mut evt).await {
+        match recv_any(&mut evt).await {
+            CoreEvent::TotalEstimate {
+                generation: 1,
+                estimate: e,
+            } => estimate = Some(e),
             CoreEvent::Batch {
                 generation,
                 docs,
                 exhausted,
-                total_estimate,
             } => {
                 assert_eq!(generation, 1);
                 if batches == 0 {
-                    assert_eq!(total_estimate, Some(500));
-                    assert_eq!(docs.len(), BATCH_SIZE);
+                    // Small first pull for instant paint.
+                    assert_eq!(docs.len(), FIRST_BATCH_SIZE);
                 }
                 total += docs.len();
                 batches += 1;
@@ -197,8 +210,19 @@ async fn browse_and_query_flow() {
             other => panic!("expected Batch, got {other:?}"),
         }
     }
+    // The background estimate may land after the last batch.
+    while estimate.is_none() {
+        if let CoreEvent::TotalEstimate {
+            generation: 1,
+            estimate: e,
+        } = recv_any(&mut evt).await
+        {
+            estimate = Some(e);
+        }
+    }
+    assert_eq!(estimate, Some(500));
     assert_eq!(total, 500);
-    assert!(batches >= 500 / BATCH_SIZE);
+    assert!(batches > 500 / BATCH_SIZE);
 
     // Stale NextBatch (wrong generation) must be silently ignored.
     cmd.send(Command::NextBatch { generation: 99 })
@@ -221,10 +245,8 @@ async fn browse_and_query_flow() {
                 generation,
                 docs,
                 exhausted,
-                total_estimate,
             } => {
                 assert_eq!(generation, 2, "stale batch leaked through");
-                assert_eq!(total_estimate, None, "filtered find has no estimate");
                 for d in &docs {
                     assert_eq!(d.get_str("status").unwrap(), "active");
                     assert!(d.get_i32("age").unwrap() > 40);
