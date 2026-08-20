@@ -10,7 +10,7 @@ use mongodb::options::ClientOptions;
 use mongodb::{Client, Cursor};
 use tokio::sync::mpsc;
 
-use crate::types::{Command, CoreEvent, CollectionInfo, DatabaseInfo, BATCH_SIZE};
+use crate::types::{CollectionInfo, Command, CoreEvent, DatabaseInfo, BATCH_SIZE};
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,7 +38,9 @@ async fn run(mut cmds: mpsc::Receiver<Command>, events: mpsc::Sender<CoreEvent>)
         generation: 0,
         events,
     };
-    let mut ping = tokio::time::interval(PING_INTERVAL);
+    // interval() fires immediately; delay the first health ping by one period.
+    let mut ping =
+        tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -65,9 +67,12 @@ impl Actor {
             Command::Connect { uri } => self.connect(uri).await,
             Command::ListDatabases => self.list_databases().await,
             Command::ListCollections { db } => self.list_collections(db).await,
-            Command::StartFind { generation, db, coll, filter } => {
-                self.start_find(generation, db, coll, filter).await
-            }
+            Command::StartFind {
+                generation,
+                db,
+                coll,
+                filter,
+            } => self.start_find(generation, db, coll, filter).await,
             Command::NextBatch { generation } => self.next_batch(generation).await,
         }
     }
@@ -95,7 +100,14 @@ impl Actor {
         match result {
             Ok((client, server_version, ping_ms)) => {
                 self.client = Some(client);
-                Self::emit(&self.events, CoreEvent::Connected { server_version, ping_ms }).await;
+                Self::emit(
+                    &self.events,
+                    CoreEvent::Connected {
+                        server_version,
+                        ping_ms,
+                    },
+                )
+                .await;
             }
             Err(e) => Self::emit(&self.events, CoreEvent::ConnectFailed(e.to_string())).await,
         }
@@ -104,10 +116,19 @@ impl Actor {
     async fn health_ping(&mut self) {
         let Some(client) = &self.client else { return };
         let started = Instant::now();
-        match client.database("admin").run_command(doc! { "ping": 1 }).await {
+        match client
+            .database("admin")
+            .run_command(doc! { "ping": 1 })
+            .await
+        {
             Ok(_) => {
-                Self::emit(&self.events, CoreEvent::Ping { ms: started.elapsed().as_millis() as u64 })
-                    .await
+                Self::emit(
+                    &self.events,
+                    CoreEvent::Ping {
+                        ms: started.elapsed().as_millis() as u64,
+                    },
+                )
+                .await
             }
             Err(e) => Self::emit(&self.events, CoreEvent::Error(format!("ping failed: {e}"))).await,
         }
@@ -119,12 +140,21 @@ impl Actor {
             Ok(specs) => {
                 let mut dbs: Vec<DatabaseInfo> = specs
                     .into_iter()
-                    .map(|s| DatabaseInfo { name: s.name, size_on_disk: s.size_on_disk })
+                    .map(|s| DatabaseInfo {
+                        name: s.name,
+                        size_on_disk: s.size_on_disk,
+                    })
                     .collect();
                 dbs.sort_by(|a, b| a.name.cmp(&b.name));
                 Self::emit(&self.events, CoreEvent::Databases(dbs)).await;
             }
-            Err(e) => Self::emit(&self.events, CoreEvent::Error(format!("listDatabases: {e}"))).await,
+            Err(e) => {
+                Self::emit(
+                    &self.events,
+                    CoreEvent::Error(format!("listDatabases: {e}")),
+                )
+                .await
+            }
         }
     }
 
@@ -141,11 +171,20 @@ impl Actor {
                         .estimated_document_count()
                         .await
                         .ok();
-                    colls.push(CollectionInfo { name, estimated_count: count });
+                    colls.push(CollectionInfo {
+                        name,
+                        estimated_count: count,
+                    });
                 }
                 Self::emit(&self.events, CoreEvent::Collections { db, colls }).await;
             }
-            Err(e) => Self::emit(&self.events, CoreEvent::Error(format!("listCollections({db}): {e}"))).await,
+            Err(e) => {
+                Self::emit(
+                    &self.events,
+                    CoreEvent::Error(format!("listCollections({db}): {e}")),
+                )
+                .await
+            }
         }
     }
 
@@ -179,7 +218,9 @@ impl Actor {
     }
 
     async fn pull_batch(&mut self, generation: u64, total_estimate: Option<u64>) {
-        let Some(cursor) = &mut self.cursor else { return };
+        let Some(cursor) = &mut self.cursor else {
+            return;
+        };
         let mut docs = Vec::with_capacity(BATCH_SIZE);
         let mut exhausted = false;
         loop {
@@ -203,7 +244,15 @@ impl Actor {
                 }
             }
         }
-        Self::emit(&self.events, CoreEvent::Batch { generation, docs, exhausted, total_estimate })
-            .await;
+        Self::emit(
+            &self.events,
+            CoreEvent::Batch {
+                generation,
+                docs,
+                exhausted,
+                total_estimate,
+            },
+        )
+        .await;
     }
 }
