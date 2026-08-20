@@ -92,7 +92,7 @@ async fn browse_and_query_flow() {
     };
     ensure_seeded(&uri).await;
 
-    let (cmd, mut evt) = actor::spawn(false);
+    let (cmd, mut evt, _cancel) = actor::spawn(false);
     cmd.send(Command::Connect { uri }).await.unwrap();
     match recv(&mut evt).await {
         CoreEvent::Connected { server_version, .. } => {
@@ -310,7 +310,7 @@ async fn write_operations_roundtrip() {
         return;
     };
     ensure_seeded(&uri).await;
-    let (cmd, mut evt) = actor::spawn(false);
+    let (cmd, mut evt, _cancel) = actor::spawn(false);
     cmd.send(Command::Connect { uri }).await.unwrap();
     assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
 
@@ -446,7 +446,7 @@ async fn read_only_mode_rejects_writes() {
         return;
     };
     ensure_seeded(&uri).await;
-    let (cmd, mut evt) = actor::spawn(true);
+    let (cmd, mut evt, _cancel) = actor::spawn(true);
     cmd.send(Command::Connect { uri }).await.unwrap();
     assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
 
@@ -477,5 +477,67 @@ async fn read_only_mode_rejects_writes() {
     match recv(&mut evt).await {
         CoreEvent::Batch { docs, .. } => assert_eq!(docs.len(), 1),
         other => panic!("expected Batch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cancellation_and_write_stage_guard() {
+    let Some(uri) = test_uri() else {
+        return;
+    };
+    ensure_seeded(&uri).await;
+    let (cmd, mut evt, cancel) = actor::spawn(false);
+    cmd.send(Command::Connect { uri }).await.unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
+
+    // Cancel generation 5 up-front: the find must abort, not return a batch.
+    cancel.send(5).unwrap();
+    cmd.send(Command::StartFind {
+        generation: 5,
+        db: "app_db".into(),
+        coll: "users".into(),
+        spec: spec(""),
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::Cancelled { generation: 5 } => {}
+        other => panic!("expected Cancelled, got {other:?}"),
+    }
+
+    // A later generation is unaffected.
+    cmd.send(Command::StartFind {
+        generation: 6,
+        db: "app_db".into(),
+        coll: "users".into(),
+        spec: FindSpec {
+            limit: Some(1),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::Batch {
+            generation: 6,
+            docs,
+            ..
+        } => assert_eq!(docs.len(), 1),
+        other => panic!("expected Batch gen 6, got {other:?}"),
+    }
+
+    // The aggregation preview must refuse $out / $merge write stages.
+    cmd.send(Command::Aggregate {
+        generation: 7,
+        db: "app_db".into(),
+        coll: "users".into(),
+        pipeline: parse_pipeline("[{ $match: {} }, { $out: 'hax' }]").unwrap(),
+        limit: 10,
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::Error(e) => assert!(e.contains("$out"), "{e}"),
+        other => panic!("expected $out rejection, got {other:?}"),
     }
 }

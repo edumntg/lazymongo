@@ -27,6 +27,14 @@ pub fn restore() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
 }
 
+/// Re-enter the TUI after a suspend (e.g. returning from mongosh).
+pub fn reenter(terminal: &mut Term) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()?; // force a full redraw
+    Ok(())
+}
+
 pub fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

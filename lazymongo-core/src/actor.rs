@@ -8,10 +8,11 @@ use futures_util::TryStreamExt;
 use mongodb::bson::{doc, Bson, Document};
 use mongodb::options::ClientOptions;
 use mongodb::{Client, Cursor, IndexModel};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::types::{
-    CollectionInfo, Command, CoreEvent, DatabaseInfo, FindSpec, IndexInfo, BATCH_SIZE,
+    pipeline_writes, CollectionInfo, Command, CoreEvent, DatabaseInfo, FindSpec, IndexInfo,
+    BATCH_SIZE,
 };
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
@@ -22,11 +23,33 @@ const COUNT_MAX_TIME: Duration = Duration::from_secs(15);
 
 /// Spawn the actor on the current tokio runtime.
 /// `read_only` rejects every write command at the I/O layer (FR-4).
-pub fn spawn(read_only: bool) -> (mpsc::Sender<Command>, mpsc::Receiver<CoreEvent>) {
+/// The returned watch sender cancels in-flight finds/aggregations: sending a
+/// generation g aborts any operation whose generation is <= g (FR-16).
+pub fn spawn(
+    read_only: bool,
+) -> (
+    mpsc::Sender<Command>,
+    mpsc::Receiver<CoreEvent>,
+    watch::Sender<u64>,
+) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
     let (evt_tx, evt_rx) = mpsc::channel::<CoreEvent>(64);
-    tokio::spawn(run(cmd_rx, evt_tx, read_only));
-    (cmd_tx, evt_rx)
+    let (cancel_tx, cancel_rx) = watch::channel(0u64);
+    tokio::spawn(run(cmd_rx, evt_tx, read_only, cancel_rx));
+    (cmd_tx, evt_rx, cancel_tx)
+}
+
+/// Resolves when the cancel watch reaches `generation` (never resolves if the
+/// sender is dropped — the racing operation future finishes instead).
+async fn cancelled(rx: &mut watch::Receiver<u64>, generation: u64) {
+    loop {
+        if *rx.borrow() >= generation {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 struct Actor {
@@ -35,15 +58,22 @@ struct Actor {
     generation: u64,
     read_only: bool,
     events: mpsc::Sender<CoreEvent>,
+    cancel_rx: watch::Receiver<u64>,
 }
 
-async fn run(mut cmds: mpsc::Receiver<Command>, events: mpsc::Sender<CoreEvent>, read_only: bool) {
+async fn run(
+    mut cmds: mpsc::Receiver<Command>,
+    events: mpsc::Sender<CoreEvent>,
+    read_only: bool,
+    cancel_rx: watch::Receiver<u64>,
+) {
     let mut actor = Actor {
         client: None,
         cursor: None,
         generation: 0,
         read_only,
         events,
+        cancel_rx,
     };
     // interval() fires immediately; delay the first health ping by one period.
     let mut ping =
@@ -268,12 +298,18 @@ impl Actor {
             find = find.skip(s);
         }
 
-        match find.await {
-            Ok(cursor) => {
+        let mut cancel = self.cancel_rx.clone();
+        let result = tokio::select! {
+            r = find => Some(r),
+            _ = cancelled(&mut cancel, generation) => None,
+        };
+        match result {
+            None => Self::emit(&self.events, CoreEvent::Cancelled { generation }).await,
+            Some(Ok(cursor)) => {
                 self.cursor = Some(cursor);
                 self.pull_batch(generation, total_estimate).await;
             }
-            Err(e) => Self::emit_err(&self.events, format!("find: {e}")).await,
+            Some(Err(e)) => Self::emit_err(&self.events, format!("find: {e}")).await,
         }
     }
 
@@ -285,13 +321,22 @@ impl Actor {
     }
 
     async fn pull_batch(&mut self, generation: u64, total_estimate: Option<u64>) {
+        let mut cancel = self.cancel_rx.clone();
         let Some(cursor) = &mut self.cursor else {
             return;
         };
         let mut docs = Vec::with_capacity(BATCH_SIZE);
         let mut exhausted = false;
         loop {
-            match cursor.try_next().await {
+            let item = tokio::select! {
+                r = cursor.try_next() => r,
+                _ = cancelled(&mut cancel, generation) => {
+                    self.cursor = None;
+                    Self::emit(&self.events, CoreEvent::Cancelled { generation }).await;
+                    return;
+                }
+            };
+            match item {
                 Ok(Some(doc)) => {
                     docs.push(doc);
                     if docs.len() >= BATCH_SIZE {
@@ -371,11 +416,37 @@ impl Actor {
         if !self.connected() {
             return;
         }
-        match self.coll(&db, &coll).aggregate(pipeline).await {
-            Ok(mut cursor) => {
+        // The preview must never write: refuse $out / $merge outright, even
+        // outside read-only mode (a preview that writes is a footgun).
+        if pipeline_writes(&pipeline) {
+            Self::emit_err(
+                &self.events,
+                "pipeline contains $out/$merge — write stages are not allowed in the preview"
+                    .into(),
+            )
+            .await;
+            return;
+        }
+        let mut cancel = self.cancel_rx.clone();
+        let collection = self.coll(&db, &coll);
+        let agg = collection.aggregate(pipeline);
+        let started = tokio::select! {
+            r = agg => Some(r),
+            _ = cancelled(&mut cancel, generation) => None,
+        };
+        match started {
+            None => Self::emit(&self.events, CoreEvent::Cancelled { generation }).await,
+            Some(Ok(mut cursor)) => {
                 let mut docs = Vec::new();
                 loop {
-                    match cursor.try_next().await {
+                    let item = tokio::select! {
+                        r = cursor.try_next() => r,
+                        _ = cancelled(&mut cancel, generation) => {
+                            Self::emit(&self.events, CoreEvent::Cancelled { generation }).await;
+                            return;
+                        }
+                    };
+                    match item {
                         Ok(Some(d)) => {
                             docs.push(d);
                             if docs.len() >= limit {
@@ -391,7 +462,7 @@ impl Actor {
                 }
                 Self::emit(&self.events, CoreEvent::AggBatch { generation, docs }).await;
             }
-            Err(e) => Self::emit_err(&self.events, format!("aggregate: {e}")).await,
+            Some(Err(e)) => Self::emit_err(&self.events, format!("aggregate: {e}")).await,
         }
     }
 

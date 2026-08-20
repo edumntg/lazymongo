@@ -9,13 +9,13 @@ use lazymongo_core::actor;
 use lazymongo_core::bson::{Bson, Document};
 use lazymongo_core::query::{parse_doc, parse_filter, parse_optional_doc};
 use lazymongo_core::types::{
-    CollectionInfo, Command, CoreEvent, DatabaseInfo, FindSpec, BATCH_SIZE,
+    pipeline_writes, CollectionInfo, Command, CoreEvent, DatabaseInfo, FindSpec, BATCH_SIZE,
 };
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::agg::{AggFocus, AggState, AGG_PREVIEW_LIMIT, DEFAULT_PIPELINE};
 use crate::input::{char_to_byte, Input};
@@ -260,6 +260,11 @@ pub struct App {
     cli_read_only: bool,
     pending_counts: HashMap<u64, PendingCount>,
     next_req_id: u64,
+    cancel_tx: watch::Sender<u64>,
+    /// The real (unredacted) URI of the active connection, for `m` (mongosh).
+    active_uri: Option<String>,
+    /// Set by the `m` key; the run loop suspends the TUI and opens mongosh.
+    pub pending_shell: bool,
     pub toast: Option<(String, bool, Instant)>, // (message, is_error, when)
     pub spinner_frame: usize,
     pub should_quit: bool,
@@ -272,7 +277,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(uri_display: String, cmd_tx: mpsc::Sender<Command>, read_only: bool) -> Self {
+    pub fn new(
+        uri_display: String,
+        cmd_tx: mpsc::Sender<Command>,
+        cancel_tx: watch::Sender<u64>,
+        read_only: bool,
+    ) -> Self {
         Self {
             conn: ConnState::Connecting,
             uri_display,
@@ -291,6 +301,9 @@ impl App {
             cli_read_only: read_only,
             pending_counts: HashMap::new(),
             next_req_id: 0,
+            cancel_tx,
+            active_uri: None,
+            pending_shell: false,
             toast: None,
             spinner_frame: 0,
             should_quit: false,
@@ -314,6 +327,12 @@ impl App {
 
     pub fn toast_info(&mut self, msg: String) {
         self.toast = Some((msg, false, Instant::now()));
+    }
+
+    /// Abort the in-flight find/aggregation, if any (FR-16).
+    fn cancel_current(&mut self) {
+        let _ = self.cancel_tx.send(self.generation);
+        self.toast_info("cancelling…".into());
     }
 
     // ---------- core events ----------
@@ -419,6 +438,15 @@ impl App {
                     .map(|(d, c)| format!("{d}.{c}"));
                 if refresh && current_ns.as_deref() == Some(namespace.as_str()) {
                     self.rerun_find();
+                }
+            }
+            CoreEvent::Cancelled { generation } => {
+                if generation == self.generation {
+                    self.results.loading = false;
+                    if let Some(agg) = &mut self.agg {
+                        agg.running = false;
+                    }
+                    self.toast_info("query cancelled".into());
                 }
             }
             CoreEvent::CountResult { req_id, n } => self.on_count_result(req_id, n),
@@ -816,6 +844,7 @@ impl App {
                 self.uri_display = format!("{} ({})", conn.name, redact_uri(&uri));
                 self.conn = ConnState::Connecting;
                 self.modal = Modal::None;
+                self.active_uri = Some(uri.clone());
                 self.send(Command::SetReadOnly(effective_ro));
                 self.send(Command::Connect { uri });
             }
@@ -1347,12 +1376,33 @@ impl App {
                 return;
             }
             KeyCode::Char('a') => return self.open_agg(),
+            KeyCode::Char('m') => return self.open_shell(),
+            KeyCode::Esc if self.results.loading => return self.cancel_current(),
             _ => {}
         }
         match self.view {
             ViewMode::Json => self.on_key_results_json(key),
             ViewMode::Table => self.on_key_results_table(key),
         }
+    }
+
+    /// Suspend the TUI and open mongosh on the active connection (run loop
+    /// performs the actual suspend/spawn/resume).
+    fn open_shell(&mut self) {
+        if self.read_only {
+            self.toast_err("read-only mode: mongosh would bypass write blocking".into());
+            return;
+        }
+        if self.active_uri.is_none() {
+            self.toast_err("no active connection".into());
+            return;
+        }
+        self.pending_shell = true;
+    }
+
+    pub fn take_shell_uri(&mut self) -> Option<String> {
+        self.pending_shell = false;
+        self.active_uri.clone()
     }
 
     // ---------- write flows (M3) ----------
@@ -1487,6 +1537,9 @@ impl App {
             self.run_agg(None);
             return;
         }
+        if key.code == KeyCode::Esc && self.agg.as_ref().is_some_and(|a| a.running) {
+            return self.cancel_current();
+        }
         let Some(agg) = &mut self.agg else {
             self.screen = Screen::Main;
             return;
@@ -1557,6 +1610,10 @@ impl App {
         let Some(mut stages) = agg.parse() else {
             return;
         };
+        if pipeline_writes(&stages) {
+            agg.error = Some("$out/$merge write stages are not allowed in the preview".into());
+            return;
+        }
         let upto = upto.unwrap_or(stages.len() - 1).min(stages.len() - 1);
         stages.truncate(upto + 1);
         agg.selected_stage = upto;
@@ -2147,13 +2204,14 @@ pub fn redact_uri(uri: &str) -> String {
 
 /// Main event loop: draw, then wait for the next input/core/tick event.
 pub async fn run(terminal: &mut term::Term, uri: Option<String>, read_only: bool) -> Result<()> {
-    let (cmd_tx, mut core_rx) = actor::spawn(read_only);
+    let (cmd_tx, mut core_rx, cancel_tx) = actor::spawn(read_only);
     let mut input_rx = event::input_channel();
-    let mut app = App::new(String::new(), cmd_tx, read_only);
+    let mut app = App::new(String::new(), cmd_tx, cancel_tx, read_only);
 
     match uri {
         Some(uri) => {
             app.uri_display = redact_uri(&uri);
+            app.active_uri = Some(uri.clone());
             app.send(Command::Connect { uri });
         }
         None => match config::load_config() {
@@ -2172,6 +2230,7 @@ pub async fn run(terminal: &mut term::Term, uri: Option<String>, read_only: bool
             Ok(_) => {
                 let uri = "mongodb://localhost:27017".to_string();
                 app.uri_display = redact_uri(&uri);
+                app.active_uri = Some(uri.clone());
                 app.send(Command::Connect { uri });
             }
         },
@@ -2196,6 +2255,23 @@ pub async fn run(terminal: &mut term::Term, uri: Option<String>, read_only: bool
             Some(ev) = core_rx.recv() => app.on_core(ev),
             _ = tick.tick() => app.on_tick(),
         }
+        if app.pending_shell {
+            if let Some(uri) = app.take_shell_uri() {
+                run_mongosh(terminal, &mut app, &uri);
+            }
+        }
     }
     Ok(())
+}
+
+/// Suspend the TUI, run mongosh attached to this terminal, resume.
+fn run_mongosh(terminal: &mut term::Term, app: &mut App, uri: &str) {
+    term::restore();
+    println!("lazymongo: opening mongosh — type exit (or Ctrl-D) to return\n");
+    let status = std::process::Command::new("mongosh").arg(uri).status();
+    let _ = term::reenter(terminal);
+    match status {
+        Ok(_) => app.toast_info("back from mongosh".into()),
+        Err(e) => app.toast_err(format!("could not launch mongosh: {e} (is it installed?)")),
+    }
 }

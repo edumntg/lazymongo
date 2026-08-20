@@ -133,6 +133,9 @@ pub enum Command {
 impl Command {
     /// True for commands that mutate data (blocked in read-only mode).
     pub fn is_write(&self) -> bool {
+        if let Command::Aggregate { pipeline, .. } = self {
+            return pipeline_writes(pipeline);
+        }
         matches!(
             self,
             Command::InsertOne { .. }
@@ -192,9 +195,20 @@ pub enum CoreEvent {
         coll: String,
         indexes: Vec<IndexInfo>,
     },
+    /// A find/aggregate was cancelled by the user before completing.
+    Cancelled {
+        generation: u64,
+    },
     /// Periodic health ping.
     Ping {
         ms: u64,
     },
     Error(String),
+}
+
+/// True when an aggregation pipeline contains write stages ($out / $merge).
+pub fn pipeline_writes(pipeline: &[Document]) -> bool {
+    pipeline
+        .iter()
+        .any(|stage| stage.contains_key("$out") || stage.contains_key("$merge"))
 }
