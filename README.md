@@ -6,14 +6,24 @@
 
 Measured on the current build: **3.4 MB release binary**, **~10 MB RSS** while browsing a 500-doc collection (PRD budgets: ≤10 MB / ≤50 MB). Cold start is instant; all MongoDB I/O runs off the render path.
 
-## Run
+## Install & run
 
 ```sh
-cargo build --release
-./target/release/lazymongo "mongodb://localhost:27017"    # or mongodb+srv://…
-./target/release/lazymongo --readonly "mongodb+srv://…"   # block all writes
-./target/release/lazymongo                                # uses saved connections (see below)
+# from source
+cargo install --path lazymongo          # installs to ~/.cargo/bin
+# or build and copy the binary anywhere on your PATH:
+cargo build --release && cp target/release/lazymongo ~/.local/bin/
+
+lazymongo "mongodb://localhost:27017"    # or mongodb+srv://…
+lazymongo --readonly "mongodb+srv://…"   # block all writes
+lazymongo                                # saved-connections picker (see below)
 ```
+
+Tagged releases (`git tag v0.1.0 && git push origin v0.1.0`) build signed-checksum
+binaries for macOS (arm64/x86_64), Linux (musl, arm64/x86_64), and Windows via
+`.github/workflows/release.yml`. A Homebrew formula template lives in
+`packaging/homebrew/lazymongo.rb` — copy it into a `homebrew-tap` repo and fill
+in the release checksums to enable `brew install <owner>/tap/lazymongo`.
 
 ## Features
 
@@ -45,7 +55,9 @@ cargo build --release
 - Pipelines are persisted per collection across sessions
 
 ### Connections
-- `~/.config/lazymongo/config.toml`:
+- **In-app manager**: press `C` anywhere (or launch with no URI) — add (`a`),
+  edit (`e`), delete (`d`), connect (`Enter`). Changes are written to config.toml.
+- Or edit `~/.config/lazymongo/config.toml` by hand:
 
 ```toml
 [[connections]]
@@ -70,14 +82,21 @@ wheel scroll) everywhere; `?` shows the full keymap; panic-safe terminal restore
 # unit tests
 cargo test --workspace
 
-# integration + PTY smoke tests need a seeded MongoDB:
+# integration tests self-seed any MongoDB (CI uses a mongo:7 service container):
 docker run -d --name lazymongo-test -p 27099:27017 mongo:7
 LAZYMONGO_TEST_URI=mongodb://localhost:27099 cargo test -p lazymongo-core
+
+# PTY smoke tests (drive the real binary via expect):
 cargo build && expect scripts/smoke.exp        # M0/M1: browse, fold, query
 expect scripts/smoke-m2.exp                    # table view, query editor, explain
 expect scripts/smoke-m3.exp                    # full write lifecycle
 expect scripts/smoke-m4.exp <scratch-xdg-dir>  # picker, aggregation, persistence
+expect scripts/smoke-connmgr.exp <scratch-dir> # in-app connection manager
 ```
+
+CI (`.github/workflows/ci.yml`) runs fmt, clippy `-D warnings`, and the full
+test suite against a MongoDB service container on every push/PR, plus build +
+unit tests on macOS and Windows.
 
 Crate layout per the PRD: `lazymongo-core` (types, relaxed query parsing, and the
 Mongo I/O actor — no TUI deps) and `lazymongo` (ratatui frontend, Elm-style

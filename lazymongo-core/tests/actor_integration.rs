@@ -27,6 +27,56 @@ fn test_uri() -> Option<String> {
     std::env::var("LAZYMONGO_TEST_URI").ok()
 }
 
+/// Seed app_db exactly once per test run (tests run in parallel), so the
+/// suite is self-contained: any empty MongoDB works, including CI service
+/// containers.
+static SEEDED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+async fn ensure_seeded(uri: &str) {
+    SEEDED
+        .get_or_init(|| async {
+            let client = mongodb::Client::with_uri_str(uri)
+                .await
+                .expect("seed: connect");
+            let db = client.database("app_db");
+            db.drop().await.expect("seed: drop app_db");
+            let users: Vec<lazymongo_core::bson::Document> = (0..500)
+                .map(|i: i32| {
+                    let tags = ["a", "b", "c"][..(i as usize % 3) + 1].to_vec();
+                    doc! {
+                        "name": format!("User {i}"),
+                        "email": format!("user{i}@example.com"),
+                        "age": 18 + (i % 50),
+                        "status": if i % 3 == 0 { "active" } else { "inactive" },
+                        "address": {
+                            "city": format!("City {}", i % 10),
+                            "geo": { "lat": f64::from(i) * 0.1, "lng": f64::from(i) * -0.2 },
+                        },
+                        "tags": tags,
+                    }
+                })
+                .collect();
+            db.collection("users")
+                .insert_many(users)
+                .await
+                .expect("seed: users");
+            let orders: Vec<lazymongo_core::bson::Document> = (0..75)
+                .map(|i: i32| {
+                    doc! {
+                        "total": f64::from(i) * 9.99,
+                        "items": [{ "sku": format!("X{i}"), "qty": i % 5 }],
+                        "paid": i % 2 == 0,
+                    }
+                })
+                .collect();
+            db.collection("orders")
+                .insert_many(orders)
+                .await
+                .expect("seed: orders");
+        })
+        .await;
+}
+
 fn spec(filter: &str) -> FindSpec {
     FindSpec {
         filter: parse_filter(filter).unwrap(),
@@ -40,6 +90,7 @@ async fn browse_and_query_flow() {
         eprintln!("LAZYMONGO_TEST_URI not set; skipping integration test");
         return;
     };
+    ensure_seeded(&uri).await;
 
     let (cmd, mut evt) = actor::spawn(false);
     cmd.send(Command::Connect { uri }).await.unwrap();
@@ -258,6 +309,7 @@ async fn write_operations_roundtrip() {
     let Some(uri) = test_uri() else {
         return;
     };
+    ensure_seeded(&uri).await;
     let (cmd, mut evt) = actor::spawn(false);
     cmd.send(Command::Connect { uri }).await.unwrap();
     assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
@@ -393,6 +445,7 @@ async fn read_only_mode_rejects_writes() {
     let Some(uri) = test_uri() else {
         return;
     };
+    ensure_seeded(&uri).await;
     let (cmd, mut evt) = actor::spawn(true);
     cmd.send(Command::Connect { uri }).await.unwrap();
     assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
