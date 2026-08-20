@@ -1,0 +1,50 @@
+#!/usr/bin/expect -f
+set timeout 15
+set S [lindex $argv 0]
+set env(XDG_CONFIG_HOME) "$S/xdg2"
+
+# No config at all -> connects to default localhost:27017 (fails, that's fine)
+# So test via C key after launching with an explicit URI.
+spawn ./target/debug/lazymongo mongodb://localhost:27099
+stty rows 40 columns 140 < $spawn_out(slave,name)
+expect { "app_db" {} timeout { send_user "\nFAIL connect\n"; exit 1 } }
+sleep 1
+# Open connection manager -> empty
+send "C"
+expect { "no saved connections" { send_user "\n=== EMPTY MANAGER OK ===\n" } timeout { send_user "\nFAIL manager\n"; exit 1 } }
+sleep 1
+# Add a connection
+send "a"
+expect { "Add connection" {} timeout { send_user "\nFAIL add form\n"; exit 1 } }
+send "demo"
+send "\t"
+send "mongodb://localhost:27099"
+send "\t\t "
+send "\r"
+expect { "connections saved" { send_user "\n=== ADD OK ===\n" } timeout { send_user "\nFAIL add save\n"; exit 1 } }
+sleep 1
+# Edit it: rename demo -> demo2
+send "e"
+expect { "Edit connection" {} timeout { send_user "\nFAIL edit form\n"; exit 1 } }
+send "2"
+send "\r"
+expect { "demo2" { send_user "\n=== EDIT OK ===\n" } timeout { send_user "\nFAIL edit save\n"; exit 1 } }
+sleep 1
+# Connect through the picker entry (read_only was toggled on -> RO badge)
+send "\r"
+expect { " RO " {} timeout { send_user "\nFAIL ro connect\n"; exit 1 } }
+expect { "app_db" { send_user "\n=== PICKER RECONNECT RO OK ===\n" } timeout { send_user "\nFAIL reconnect\n"; exit 1 } }
+sleep 1
+# Delete it
+send "C"
+expect { "demo2" {} timeout { send_user "\nFAIL reopen\n"; exit 1 } }
+send "d"
+expect { "Delete connection" {} timeout { send_user "\nFAIL delete confirm\n"; exit 1 } }
+send "y"
+expect { "removed connection" { send_user "\n=== DELETE OK ===\n" } timeout { send_user "\nFAIL delete\n"; exit 1 } }
+sleep 1
+send "\x1b"
+sleep 1
+send "q"
+expect eof
+send_user "\n=== CONN MGR CLEAN EXIT ===\n"

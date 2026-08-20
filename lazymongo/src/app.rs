@@ -21,8 +21,8 @@ use crate::agg::{AggFocus, AggState, AGG_PREVIEW_LIMIT, DEFAULT_PIPELINE};
 use crate::input::{char_to_byte, Input};
 use crate::json_view::{doc_lines, RLine};
 use crate::modal::{
-    Confirm, DocView, EditorPurpose, IndexesView, JsonEditor, Modal, PendingAction, Prompt,
-    PromptAction, QueryEditor,
+    Confirm, ConnForm, DocView, EditorPurpose, IndexesView, JsonEditor, Modal, PendingAction,
+    Prompt, PromptAction, QueryEditor,
 };
 use crate::textarea::TextArea;
 use crate::{config, event, term, ui, util};
@@ -531,6 +531,7 @@ impl App {
             KeyCode::Char('2') => self.focus = Pane::Results,
             KeyCode::Char('3') => self.focus = Pane::Query,
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('C') => self.open_connections(),
             _ => match self.focus {
                 Pane::Explorer => self.on_key_explorer(key),
                 Pane::Results => self.on_key_results(key),
@@ -674,8 +675,15 @@ impl App {
                 }
             },
             Modal::Connections { items, selected } => match key.code {
-                // Nothing behind the picker: Esc/q quit the app.
-                KeyCode::Esc | KeyCode::Char('q') => self.should_quit = true,
+                // With no connection behind the picker, Esc/q quit the app;
+                // otherwise they just close it.
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    if matches!(self.conn, ConnState::Idle) {
+                        self.should_quit = true;
+                    } else {
+                        self.modal = Modal::None;
+                    }
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
                     *selected = (*selected + 1).min(items.len().saturating_sub(1))
                 }
@@ -688,8 +696,96 @@ impl App {
                         self.connect_selected();
                     }
                 }
+                KeyCode::Char('a') => {
+                    self.modal = Modal::ConnForm(ConnForm::new(items.clone(), None));
+                }
+                KeyCode::Char('e') => {
+                    if !items.is_empty() {
+                        self.modal = Modal::ConnForm(ConnForm::new(items.clone(), Some(*selected)));
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if items.is_empty() {
+                        return;
+                    }
+                    let name = items[*selected].name.clone();
+                    self.modal = Modal::Confirm(Confirm {
+                        title: "Delete connection".into(),
+                        body: vec![format!("Remove \"{name}\" from config.toml?")],
+                        typed_required: None,
+                        typed: Input::default(),
+                        action: PendingAction::DeleteConnection {
+                            items: items.clone(),
+                            index: *selected,
+                        },
+                    });
+                }
                 _ => {}
             },
+            Modal::ConnForm(form) => match key.code {
+                KeyCode::Esc => {
+                    self.modal = Modal::Connections {
+                        items: form.items.clone(),
+                        selected: 0,
+                    };
+                }
+                KeyCode::Tab | KeyCode::Down => form.focus = (form.focus + 1) % 4,
+                KeyCode::BackTab | KeyCode::Up => form.focus = (form.focus + 3) % 4,
+                KeyCode::Enter => self.submit_conn_form(),
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if form.focus == 3 => {
+                    form.read_only = !form.read_only;
+                }
+                _ => {
+                    if form.focus < 3 && form.fields[form.focus].on_key(key) {
+                        form.error = None;
+                    }
+                }
+            },
+        }
+    }
+
+    /// Validate the connection form, write config.toml, reopen the picker.
+    fn submit_conn_form(&mut self) {
+        let Modal::ConnForm(form) = &mut self.modal else {
+            return;
+        };
+        let conn = match form.build() {
+            Ok(c) => c,
+            Err(e) => {
+                form.error = Some(e);
+                return;
+            }
+        };
+        let mut items = form.items.clone();
+        let selected = match form.editing {
+            Some(i) => {
+                items[i] = conn;
+                i
+            }
+            None => {
+                items.push(conn);
+                items.len() - 1
+            }
+        };
+        match config::save_connections(&items) {
+            Ok(()) => {
+                self.toast_info("connections saved".into());
+                self.modal = Modal::Connections { items, selected };
+            }
+            Err(e) => form.error = Some(format!("could not save: {e}")),
+        }
+    }
+
+    /// Open the connection manager (also reachable any time via C).
+    fn open_connections(&mut self) {
+        match config::load_config() {
+            Err(e) => self.toast_err(e),
+            Ok(cfg) => {
+                self.modal = Modal::Connections {
+                    items: cfg.connections,
+                    selected: 0,
+                };
+            }
         }
     }
 
@@ -698,10 +794,23 @@ impl App {
         let Modal::Connections { items, selected } = &self.modal else {
             return;
         };
+        if items.is_empty() {
+            return;
+        }
         let conn = items[*selected].clone();
         match conn.resolve_uri() {
             Err(e) => self.toast_err(e),
             Ok(uri) => {
+                // Reset all per-connection state (also handles re-connects).
+                self.explorer = Explorer::default();
+                self.results = Results::default();
+                self.query = QueryBar::default();
+                self.extras = SpecExtras::default();
+                self.agg = None;
+                self.screen = Screen::Main;
+                self.focus = Pane::Explorer;
+                self.generation += 1; // invalidate in-flight batches
+
                 let effective_ro = self.cli_read_only || conn.read_only;
                 self.read_only = effective_ro;
                 self.uri_display = format!("{} ({})", conn.name, redact_uri(&uri));
@@ -780,6 +889,15 @@ impl App {
                     self.results = Results::default();
                 }
                 self.send(Command::DropCollection { db, coll });
+            }
+            PendingAction::DeleteConnection { mut items, index } => {
+                let name = items.remove(index).name;
+                match config::save_connections(&items) {
+                    Ok(()) => self.toast_info(format!("removed connection \"{name}\"")),
+                    Err(e) => self.toast_err(format!("could not save: {e}")),
+                }
+                let selected = index.min(items.len().saturating_sub(1));
+                self.modal = Modal::Connections { items, selected };
             }
         }
     }

@@ -22,11 +22,14 @@ pub enum Modal {
         scroll: usize,
     },
     Prompt(Prompt),
-    /// Saved-connection picker shown at startup when no URI was given (FR-2).
+    /// Saved-connection picker shown at startup when no URI was given (FR-2),
+    /// or any time via the C key.
     Connections {
         items: Vec<SavedConnection>,
         selected: usize,
     },
+    /// Add/edit form for a saved connection.
+    ConnForm(ConnForm),
 }
 
 impl Modal {
@@ -109,13 +112,35 @@ impl DocView {
 
 /// A destructive (or write) action waiting for confirmation (FR-29/30/31).
 pub enum PendingAction {
-    ApplyEdit { id: Bson, doc: Document },
-    DeleteOne { id: Bson },
-    DeleteMany { filter: Document },
-    UpdateMany { filter: Document, update: Document },
-    CreateIndex { keys: Document },
-    DropIndex { name: String },
-    DropCollection { db: String, coll: String },
+    ApplyEdit {
+        id: Bson,
+        doc: Document,
+    },
+    DeleteOne {
+        id: Bson,
+    },
+    DeleteMany {
+        filter: Document,
+    },
+    UpdateMany {
+        filter: Document,
+        update: Document,
+    },
+    CreateIndex {
+        keys: Document,
+    },
+    DropIndex {
+        name: String,
+    },
+    DropCollection {
+        db: String,
+        coll: String,
+    },
+    /// Remove a saved connection from config.toml.
+    DeleteConnection {
+        items: Vec<SavedConnection>,
+        index: usize,
+    },
 }
 
 /// Confirmation modal. When `typed_required` is set, the user must type
@@ -164,6 +189,75 @@ pub struct IndexesView {
     pub coll: String,
     pub indexes: Option<Vec<IndexInfo>>, // None while loading
     pub selected: usize,
+}
+
+/// Add/edit form for a saved connection. Fields: name, uri, uri_env;
+/// plus a read-only toggle. Writes back to config.toml on save.
+pub struct ConnForm {
+    /// Snapshot of the full connections list being edited.
+    pub items: Vec<SavedConnection>,
+    /// Index being edited; None = adding a new connection.
+    pub editing: Option<usize>,
+    pub fields: [Input; 3],
+    pub read_only: bool,
+    /// 0..=2 = text fields, 3 = read-only toggle.
+    pub focus: usize,
+    pub error: Option<String>,
+}
+
+pub const CONN_FIELD_LABELS: [&str; 3] = ["name", "uri", "uri_env"];
+
+impl ConnForm {
+    pub fn new(items: Vec<SavedConnection>, editing: Option<usize>) -> Self {
+        let (name, uri, uri_env, read_only) = match editing.and_then(|i| items.get(i)) {
+            Some(c) => (
+                c.name.clone(),
+                c.uri.clone().unwrap_or_default(),
+                c.uri_env.clone().unwrap_or_default(),
+                c.read_only,
+            ),
+            None => Default::default(),
+        };
+        Self {
+            items,
+            editing,
+            fields: [
+                Input::with_text(name),
+                Input::with_text(uri),
+                Input::with_text(uri_env),
+            ],
+            read_only,
+            focus: 0,
+            error: None,
+        }
+    }
+
+    /// Validate and build the connection from the form fields.
+    pub fn build(&self) -> Result<SavedConnection, String> {
+        let name = self.fields[0].text.trim().to_string();
+        let uri = self.fields[1].text.trim().to_string();
+        let uri_env = self.fields[2].text.trim().to_string();
+        if name.is_empty() {
+            return Err("name cannot be empty".into());
+        }
+        if uri.is_empty() && uri_env.is_empty() {
+            return Err("set uri or uri_env".into());
+        }
+        let duplicate = self
+            .items
+            .iter()
+            .enumerate()
+            .any(|(i, c)| Some(i) != self.editing && c.name == name);
+        if duplicate {
+            return Err(format!("a connection named \"{name}\" already exists"));
+        }
+        Ok(SavedConnection {
+            name,
+            uri: (!uri.is_empty()).then_some(uri),
+            uri_env: (!uri_env.is_empty()).then_some(uri_env),
+            read_only: self.read_only,
+        })
+    }
 }
 
 /// What a submitted prompt value is used for.

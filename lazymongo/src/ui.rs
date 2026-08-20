@@ -12,7 +12,8 @@ use crate::agg::{AggFocus, AggState};
 use crate::app::{App, ConnState, ExplorerRow, Pane, Screen, ViewMode};
 use crate::config::SavedConnection;
 use crate::modal::{
-    Confirm, DocView, IndexesView, JsonEditor, Modal, Prompt, QueryEditor, QUERY_FIELD_LABELS,
+    Confirm, ConnForm, DocView, IndexesView, JsonEditor, Modal, Prompt, QueryEditor,
+    CONN_FIELD_LABELS, QUERY_FIELD_LABELS,
 };
 use crate::util;
 
@@ -546,6 +547,20 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
                 ("esc", "close"),
             ],
             Modal::Prompt(_) => &[("type", "name"), ("↵", "ok"), ("esc", "cancel")],
+            Modal::Connections { .. } => &[
+                ("↑↓", "move"),
+                ("↵", "connect"),
+                ("a", "add"),
+                ("e", "edit"),
+                ("d", "delete"),
+                ("esc", "close/quit"),
+            ],
+            Modal::ConnForm(_) => &[
+                ("tab/↑↓", "field"),
+                ("space", "toggle ro"),
+                ("↵", "save"),
+                ("esc", "back"),
+            ],
             _ => &[("any key", "close")],
         }
     } else {
@@ -635,21 +650,28 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
         Modal::OpsLog { scroll } => draw_ops_log(f, f.area(), &app.ops_log, scroll),
         Modal::Prompt(prompt) => draw_prompt(f, f.area(), prompt),
         Modal::Connections { items, selected } => draw_connections(f, f.area(), items, *selected),
+        Modal::ConnForm(form) => draw_conn_form(f, f.area(), form),
     }
 }
 
 fn draw_connections(f: &mut Frame, area: Rect, items: &[SavedConnection], selected: usize) {
-    let h = (items.len() as u16 + 4).clamp(6, 20);
-    let popup = centered(area, 58, h);
+    let h = (items.len() as u16 + 4).clamp(7, 20);
+    let popup = centered(area, 64, h);
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Green))
-        .title(" Connections ─ ↵ connect · q quit ");
+        .title(" Connections ─ ↵ connect · a add · e edit · d delete ");
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let mut lines: Vec<Line> = Vec::new();
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no saved connections — press a to add one",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
     for (i, conn) in items.iter().enumerate() {
         let ro = if conn.read_only { "  [read-only]" } else { "" };
         let source = match (&conn.uri, &conn.uri_env) {
@@ -667,6 +689,72 @@ fn draw_connections(f: &mut Frame, area: Rect, items: &[SavedConnection], select
             line.style = Style::new().bg(Color::Blue);
         }
         lines.push(line);
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn draw_conn_form(f: &mut Frame, area: Rect, form: &ConnForm) {
+    let popup = centered(area, 64, 13);
+    f.render_widget(Clear, popup);
+    let title = match form.editing {
+        Some(_) => " Edit connection ─ ↵ save · esc back ",
+        None => " Add connection ─ ↵ save · esc back ",
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Green))
+        .title(title);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, field) in form.fields.iter().enumerate() {
+        let focused = i == form.focus;
+        let label_style = if focused {
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Cyan)
+        };
+        let mut spans = vec![Span::styled(
+            format!(" {:<10}", CONN_FIELD_LABELS[i]),
+            label_style,
+        )];
+        spans.extend(field.spans(focused));
+        lines.push(Line::from(spans));
+        lines.push(Line::raw(""));
+    }
+    let ro_focused = form.focus == 3;
+    lines.push(Line::from(vec![
+        Span::styled(
+            " read_only ",
+            if ro_focused {
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::Cyan)
+            },
+        ),
+        Span::styled(
+            if form.read_only { "[x]" } else { "[ ]" },
+            if ro_focused {
+                Style::new()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new().fg(Color::White)
+            },
+        ),
+        Span::styled("  (space toggles)", Style::new().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        " tip: leave uri empty and set uri_env to keep secrets out of the file",
+        Style::new().fg(Color::DarkGray),
+    )));
+    if let Some(e) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!(" ✗ {e}"),
+            Style::new().fg(Color::Red),
+        )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -1097,6 +1185,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("q / ctrl-c"), txt("quit")]),
         Line::from(vec![key("tab / 1 2 3"), txt("switch pane")]),
         Line::from(vec![key("r"), txt("refresh current pane")]),
+        Line::from(vec![key("C"), txt("connection manager (add/edit/switch)")]),
         Line::from(vec![key("?"), txt("toggle this help")]),
         Line::raw(""),
         head("Explorer"),

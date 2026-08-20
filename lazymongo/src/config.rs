@@ -10,12 +10,12 @@ pub const HISTORY_CAP: usize = 50;
 
 /// Saved connection (FR-2/FR-3). Secrets are never stored inline unless the
 /// user opts to: `uri_env` references an environment variable instead.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedConnection {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri_env: Option<String>,
     #[serde(default)]
     pub read_only: bool,
@@ -37,7 +37,7 @@ impl SavedConnection {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub connections: Vec<SavedConnection>,
@@ -59,6 +59,21 @@ pub fn load_config() -> Result<Config, String> {
         Err(_) => Ok(Config::default()),
         Ok(body) => toml::from_str(&body).map_err(|e| format!("{}: {e}", path.display())),
     }
+}
+
+/// Write the connections list back to config.toml (in-app connection
+/// management). Note: rewriting drops any hand-written comments.
+pub fn save_connections(connections: &[SavedConnection]) -> Result<(), String> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let config = Config {
+        connections: connections.to_vec(),
+    };
+    let body = toml::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    let body = format!(
+        "# lazymongo connections — managed in-app (C key) or by hand.\n# Prefer uri_env over uri for secrets: the URI is read from that env var.\n\n{body}"
+    );
+    std::fs::write(dir.join("config.toml"), body).map_err(|e| e.to_string())
 }
 
 /// Persisted per-collection state, keyed by "db.coll".
@@ -98,4 +113,60 @@ pub fn save_state(state: &State) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let body = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("state.json"), body).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_roundtrips_through_toml() {
+        let conns = vec![
+            SavedConnection {
+                name: "local".into(),
+                uri: Some("mongodb://localhost:27017".into()),
+                uri_env: None,
+                read_only: false,
+            },
+            SavedConnection {
+                name: "prod".into(),
+                uri: None,
+                uri_env: Some("MONGO_PROD_URI".into()),
+                read_only: true,
+            },
+        ];
+        let body = toml::to_string_pretty(&Config {
+            connections: conns.clone(),
+        })
+        .unwrap();
+        // Inline `uri = none` must not be emitted.
+        assert!(!body.contains("uri =") || body.contains("uri = \"mongodb"));
+        let parsed: Config = toml::from_str(&body).unwrap();
+        assert_eq!(parsed.connections.len(), 2);
+        assert_eq!(parsed.connections[0].name, "local");
+        assert_eq!(
+            parsed.connections[1].uri_env.as_deref(),
+            Some("MONGO_PROD_URI")
+        );
+        assert!(parsed.connections[1].read_only);
+        assert!(parsed.connections[1].uri.is_none());
+    }
+
+    #[test]
+    fn resolve_uri_precedence_and_errors() {
+        let c = SavedConnection {
+            name: "x".into(),
+            uri: Some("mongodb://a".into()),
+            uri_env: Some("SOME_VAR".into()),
+            read_only: false,
+        };
+        assert_eq!(c.resolve_uri().unwrap(), "mongodb://a");
+        let c = SavedConnection {
+            name: "y".into(),
+            uri: None,
+            uri_env: None,
+            read_only: false,
+        };
+        assert!(c.resolve_uri().is_err());
+    }
 }
