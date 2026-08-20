@@ -1,0 +1,42 @@
+#!/usr/bin/expect -f
+set timeout 15
+set S [lindex $argv 0]
+set env(XDG_CONFIG_HOME) "$S/xdg3"
+spawn ./target/debug/lazymongo mongodb://localhost:27099
+stty rows 40 columns 140 < $spawn_out(slave,name)
+expect { "app_db" {} timeout { send_user "\nFAIL connect\n"; exit 1 } }
+sleep 1
+send "/app_db\r"
+sleep 1
+send "\r"
+expect { "users" {} timeout { send_user "\nFAIL expand\n"; exit 1 } }
+sleep 1
+send "jj\r"
+expect { "User 0" {} timeout { send_user "\nFAIL open\n"; exit 1 } }
+sleep 1
+# In-results search: jump to the doc containing "User 49"
+send "/User 49\r"
+sleep 1
+send "o"
+expect { "doc 50" { send_user "\n=== SEARCH JUMP OK ===\n" } timeout { send_user "\nFAIL search jump\n"; exit 1 } }
+send "\x1b"
+sleep 1
+# Command palette: toggle to table view
+send "\x10"
+expect { "Command palette" {} timeout { send_user "\nFAIL palette open\n"; exit 1 } }
+send "toggle"
+sleep 1
+send "\r"
+expect { "\[table\]" { send_user "\n=== PALETTE ACTION OK ===\n" } timeout { send_user "\nFAIL palette action\n"; exit 1 } }
+sleep 1
+# Palette: switch theme to termius, persists to config
+send ":"
+expect { "Command palette" {} timeout { send_user "\nFAIL colon palette\n"; exit 1 } }
+send "termius"
+sleep 1
+send "\r"
+expect { "theme: termius (saved)" { send_user "\n=== THEME SWITCH OK ===\n" } timeout { send_user "\nFAIL theme switch\n"; exit 1 } }
+sleep 1
+send "q"
+expect eof
+send_user "\n=== PALETTE/SEARCH CLEAN EXIT ===\n"

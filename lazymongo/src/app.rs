@@ -21,10 +21,11 @@ use crate::agg::{AggFocus, AggState, AGG_PREVIEW_LIMIT, DEFAULT_PIPELINE};
 use crate::input::{char_to_byte, Input};
 use crate::json_view::{doc_lines, RLine};
 use crate::modal::{
-    Confirm, ConnForm, DocView, EditorPurpose, IndexesView, JsonEditor, Modal, PendingAction,
-    Prompt, PromptAction, QueryEditor,
+    AppAction, Confirm, ConnForm, DocView, EditorPurpose, IndexesView, JsonEditor, Modal, Palette,
+    PendingAction, Prompt, PromptAction, QueryEditor,
 };
 use crate::textarea::TextArea;
+use crate::theme;
 use crate::{config, event, term, ui, util};
 
 /// Memory cap: max documents held in the sliding window (NFR-3).
@@ -189,6 +190,9 @@ pub struct Results {
     /// Spec used for the active find (already parsed).
     pub active_spec: FindSpec,
     pub table: TableView,
+    /// In-results search (FR-26).
+    pub search: String,
+    pub searching: bool,
 }
 
 impl Results {
@@ -539,6 +543,13 @@ impl App {
             self.should_quit = true;
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('p')
+            && self.screen == Screen::Main
+            && !self.modal.is_open()
+        {
+            return self.open_palette();
+        }
         if self.screen == Screen::Agg {
             return self.on_key_agg(key);
         }
@@ -552,7 +563,13 @@ impl App {
         if self.focus == Pane::Explorer && self.explorer.filtering {
             return self.on_key_explorer_filter(key);
         }
+        if self.focus == Pane::Results && self.results.searching {
+            return self.on_key_results_search(key);
+        }
 
+        if key.code == KeyCode::Char(':') {
+            return self.open_palette();
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.modal = Modal::Help,
@@ -703,6 +720,27 @@ impl App {
                 KeyCode::Enter => self.submit_prompt(),
                 _ => {
                     prompt.input.on_key(key);
+                }
+            },
+            Modal::Palette(palette) => match key.code {
+                KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Down | KeyCode::Tab => {
+                    palette.selected =
+                        (palette.selected + 1).min(palette.filtered.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    palette.selected = palette.selected.saturating_sub(1)
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = palette.selected_action() {
+                        self.modal = Modal::None;
+                        self.run_action(action);
+                    }
+                }
+                _ => {
+                    if palette.input.on_key(key) {
+                        palette.refilter();
+                    }
                 }
             },
             Modal::Connections { items, selected } => match key.code {
@@ -1116,6 +1154,97 @@ impl App {
         }
     }
 
+    /// Open the command palette (FR-36): every feature, fuzzy-searchable.
+    fn open_palette(&mut self) {
+        let mut actions: Vec<(String, AppAction)> = vec![
+            (
+                "view: toggle json / table (v)".into(),
+                AppAction::ToggleView,
+            ),
+            (
+                "query: structured editor — filter/projection/sort/limit (F)".into(),
+                AppAction::QueryEditor,
+            ),
+            ("query: explain plan (x)".into(), AppAction::Explain),
+            ("doc: open full-screen (o)".into(), AppAction::DocView),
+            ("doc: copy to clipboard (y)".into(), AppAction::CopyDoc),
+            (
+                "export loaded docs as json/csv (E)".into(),
+                AppAction::Export,
+            ),
+            ("write: edit document (e)".into(), AppAction::EditDoc),
+            ("write: insert document (i)".into(), AppAction::InsertDoc),
+            ("write: delete document (d)".into(), AppAction::DeleteDoc),
+            (
+                "write: delete many by filter (D)".into(),
+                AppAction::DeleteMany,
+            ),
+            (
+                "write: update many by filter (U)".into(),
+                AppAction::UpdateMany,
+            ),
+            (
+                "indexes: list / create / drop (I)".into(),
+                AppAction::Indexes,
+            ),
+            ("operations log (L)".into(), AppAction::OpsLog),
+            ("aggregation editor (a)".into(), AppAction::Aggregate),
+            ("shell: open mongosh here (m)".into(), AppAction::OpenShell),
+            (
+                "connections: manage / switch (C)".into(),
+                AppAction::Connections,
+            ),
+            ("refresh (r)".into(), AppAction::Refresh),
+            ("help / keybindings (?)".into(), AppAction::Help),
+            ("quit (q)".into(), AppAction::Quit),
+        ];
+        for name in theme::NAMES {
+            actions.push((format!("theme: {name}"), AppAction::SetTheme(name)));
+        }
+        self.modal = Modal::Palette(Palette::new(actions));
+    }
+
+    fn run_action(&mut self, action: AppAction) {
+        match action {
+            AppAction::ToggleView => {
+                self.view = match self.view {
+                    ViewMode::Json => ViewMode::Table,
+                    ViewMode::Table => ViewMode::Json,
+                }
+            }
+            AppAction::QueryEditor => self.open_query_editor(),
+            AppAction::Explain => self.explain_current(),
+            AppAction::DocView => self.open_doc_view(),
+            AppAction::CopyDoc => self.copy_current_doc(),
+            AppAction::Export => self.export_results(),
+            AppAction::EditDoc => self.edit_current_doc(),
+            AppAction::InsertDoc => self.insert_doc_flow(),
+            AppAction::DeleteDoc => self.delete_current_doc(),
+            AppAction::DeleteMany => self.delete_many_flow(),
+            AppAction::UpdateMany => self.update_many_flow(),
+            AppAction::Indexes => self.open_indexes(),
+            AppAction::OpsLog => self.modal = Modal::OpsLog { scroll: 0 },
+            AppAction::Aggregate => self.open_agg(),
+            AppAction::OpenShell => self.open_shell(),
+            AppAction::Connections => self.open_connections(),
+            AppAction::Refresh => self.refresh(),
+            AppAction::Help => self.modal = Modal::Help,
+            AppAction::Quit => self.should_quit = true,
+            AppAction::SetTheme(name) => {
+                if theme::set_by_name(name) {
+                    self.config_theme = Some(name.to_string());
+                    let mut cfg = config::load_config().unwrap_or_default();
+                    cfg.theme = Some(name.to_string());
+                    if let Err(e) = config::save_config(&cfg) {
+                        self.toast_err(format!("theme set, but not saved: {e}"));
+                    } else {
+                        self.toast_info(format!("theme: {name} (saved)"));
+                    }
+                }
+            }
+        }
+    }
+
     fn cycle_focus(&mut self, back: bool) {
         self.focus = match (self.focus, back) {
             (Pane::Explorer, false) => Pane::Results,
@@ -1388,6 +1517,17 @@ impl App {
             }
             KeyCode::Char('a') => return self.open_agg(),
             KeyCode::Char('m') => return self.open_shell(),
+            KeyCode::Char('/') => {
+                self.results.searching = true;
+                self.results.search.clear();
+                return;
+            }
+            KeyCode::Char('n') if !self.results.search.is_empty() => {
+                return self.jump_to_match(true, false)
+            }
+            KeyCode::Char('N') if !self.results.search.is_empty() => {
+                return self.jump_to_match(false, false)
+            }
             KeyCode::Esc if self.results.loading => return self.cancel_current(),
             _ => {}
         }
@@ -1799,6 +1939,84 @@ impl App {
         }
     }
 
+    /// Typing mode for in-results search (FR-26): live-jumps as you type.
+    fn on_key_results_search(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.results.searching = false;
+                self.results.search.clear();
+            }
+            KeyCode::Enter => self.results.searching = false,
+            KeyCode::Backspace => {
+                self.results.search.pop();
+                self.jump_to_match(true, true);
+            }
+            KeyCode::Char(c) => {
+                self.results.search.push(c);
+                self.jump_to_match(true, true);
+            }
+            _ => {}
+        }
+    }
+
+    /// Move to the next/previous match; `include_current` keeps the cursor in
+    /// place if it already matches (used while typing).
+    fn jump_to_match(&mut self, forward: bool, include_current: bool) {
+        let needle = self.results.search.to_lowercase();
+        if needle.is_empty() {
+            return;
+        }
+        match self.view {
+            ViewMode::Json => {
+                let n = self.results.lines.len();
+                if n == 0 {
+                    return;
+                }
+                let hit = |i: usize| {
+                    rline_text(&self.results.lines[i])
+                        .to_lowercase()
+                        .contains(&needle)
+                };
+                let cur = self.results.cursor;
+                if include_current && hit(cur) {
+                    return;
+                }
+                let found = scan(n, cur, forward, include_current, hit);
+                if let Some(i) = found {
+                    self.results.cursor = i;
+                } else {
+                    self.toast_info(format!("no match for \"{}\"", self.results.search));
+                }
+            }
+            ViewMode::Table => {
+                let n = self.results.docs.len();
+                if n == 0 {
+                    return;
+                }
+                let cols = self.results.table.columns.clone();
+                let hit = |i: usize| {
+                    let doc = &self.results.docs[i];
+                    cols.iter().any(|c| {
+                        doc.get(c)
+                            .map(|v| util::bson_to_compact(v).to_lowercase().contains(&needle))
+                            .unwrap_or(false)
+                    })
+                };
+                let cur = self.results.table.row;
+                if include_current && hit(cur) {
+                    return;
+                }
+                let found = scan(n, cur, forward, include_current, hit);
+                if let Some(i) = found {
+                    self.results.table.row = i;
+                } else {
+                    self.toast_info(format!("no match for \"{}\"", self.results.search));
+                }
+            }
+        }
+        self.maybe_fetch_more();
+    }
+
     fn move_results_cursor(&mut self, delta: isize) {
         let len = self.results.lines.len();
         if len == 0 {
@@ -2135,6 +2353,42 @@ fn build_spec(
         limit: parse_num(limit, "limit")?,
         skip: parse_num(skip, "skip")?.map(|n| n.max(0) as u64),
     })
+}
+
+/// Concatenated plain text of a rendered line (for search).
+fn rline_text(l: &RLine) -> String {
+    l.line
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+}
+
+/// Scan indices circularly from `start`, forward or backward, returning the
+/// first index where `hit` is true.
+fn scan(
+    n: usize,
+    start: usize,
+    forward: bool,
+    include_current: bool,
+    hit: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let offsets: Box<dyn Iterator<Item = usize>> = if include_current {
+        Box::new(0..n)
+    } else {
+        Box::new(1..=n)
+    };
+    for off in offsets {
+        let i = if forward {
+            (start + off) % n
+        } else {
+            (start + n - (off % n)) % n
+        };
+        if hit(i) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Compact relaxed-extjson rendering of a filter/update doc for summaries.

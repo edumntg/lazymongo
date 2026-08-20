@@ -37,7 +37,11 @@ in the release checksums to enable `brew install <owner>/tap/lazymongo`.
 - Structured query editor (`F`): filter / projection / sort / limit / skip
 - Full-screen document view (`o`, or `Enter` on a table row)
 - `x` **explain** (executionStats) with a COLLSCAN warning banner
+- `/` **search** loaded results (live jump, `n`/`N` next/prev) — json and table views
+- `Esc` **cancels** a running query or aggregation mid-flight
 - `y` copy doc to clipboard · `E` export loaded window as JSON or CSV
+- `Ctrl-P` / `:` **command palette**: every feature fuzzy-searchable, incl. theme switching
+- `m` drops you into **mongosh** on the current connection (TUI suspends/resumes)
 
 ### Write operations (all confirmed, all logged)
 - `e` edit document in a JSON editor — field-level diff shown before `replaceOne`
@@ -53,6 +57,13 @@ in the release checksums to enable `brew install <owner>/tap/lazymongo`.
 - Full-screen JSON5 pipeline editor with **stage-by-stage preview**: select any stage
   and run the pipeline truncated to it (`Enter`), or `Ctrl-R` for the full pipeline
 - Pipelines are persisted per collection across sessions
+- `$out`/`$merge` write stages are refused in the preview (a preview must never write)
+
+### Themes
+Six built-in palettes: `dark` (default), `light`, `claude-dark`, `claude-light`,
+`termius`, `high-contrast`. Switch via the command palette (persists), the
+`--theme` flag, or `theme = "claude-dark"` in config.toml. The ANSI themes
+inherit your terminal's scheme; the branded ones use truecolor.
 
 ### Connections
 - **In-app manager**: press `C` anywhere (or launch with no URI) — add (`a`),
@@ -103,6 +114,7 @@ Mongo I/O actor — no TUI deps) and `lazymongo` (ratatui frontend, Elm-style
 update loop).
 
 ### Not yet implemented (post-v1)
-Themes/config beyond connections, in-results text search, `$EDITOR` integration,
-non-interactive `--eval` mode, `killOp`-based cancellation, raw-BSON document
-storage. See PRD.md for the roadmap.
+`$EDITOR` integration for document editing, non-interactive `--eval` mode,
+server-side `killOp` on cancel (client-side cancellation works; the server op
+is still bounded by maxTimeMS), OS-keychain secrets, schema sampling view,
+raw-BSON document storage. See PRD.md for the roadmap.

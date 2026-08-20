@@ -30,6 +30,8 @@ pub enum Modal {
     },
     /// Add/edit form for a saved connection.
     ConnForm(ConnForm),
+    /// Fuzzy command palette (FR-36).
+    Palette(Palette),
 }
 
 impl Modal {
@@ -270,4 +272,128 @@ pub struct Prompt {
     pub title: String,
     pub input: Input,
     pub action: PromptAction,
+}
+
+/// Every UI action reachable from the command palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppAction {
+    ToggleView,
+    QueryEditor,
+    Explain,
+    DocView,
+    CopyDoc,
+    Export,
+    EditDoc,
+    InsertDoc,
+    DeleteDoc,
+    DeleteMany,
+    UpdateMany,
+    Indexes,
+    OpsLog,
+    Aggregate,
+    OpenShell,
+    Connections,
+    Refresh,
+    Help,
+    Quit,
+    SetTheme(&'static str),
+}
+
+/// Fuzzy command palette (FR-36): every feature reachable by name.
+pub struct Palette {
+    pub input: Input,
+    pub actions: Vec<(String, AppAction)>,
+    /// Indices into `actions`, best match first.
+    pub filtered: Vec<usize>,
+    pub selected: usize,
+}
+
+impl Palette {
+    pub fn new(actions: Vec<(String, AppAction)>) -> Self {
+        let filtered = (0..actions.len()).collect();
+        Self {
+            input: Input::default(),
+            actions,
+            filtered,
+            selected: 0,
+        }
+    }
+
+    pub fn refilter(&mut self) {
+        let needle = self.input.text.trim().to_lowercase();
+        let mut scored: Vec<(i32, usize)> = self
+            .actions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (label, _))| fuzzy_score(&needle, label).map(|s| (s, i)))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        self.filtered = scored.into_iter().map(|(_, i)| i).collect();
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+    }
+
+    pub fn selected_action(&self) -> Option<AppAction> {
+        self.filtered.get(self.selected).map(|&i| self.actions[i].1)
+    }
+}
+
+/// Case-insensitive subsequence match; higher scores for consecutive runs
+/// and earlier matches. None = no match.
+pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let hay: Vec<char> = haystack.to_lowercase().chars().collect();
+    let mut score = 0i32;
+    let mut hi = 0usize;
+    let mut last_hit: Option<usize> = None;
+    for nc in needle.chars() {
+        let mut found = None;
+        while hi < hay.len() {
+            if hay[hi] == nc {
+                found = Some(hi);
+                break;
+            }
+            hi += 1;
+        }
+        let pos = found?;
+        score += match last_hit {
+            Some(prev) if pos == prev + 1 => 3, // consecutive bonus
+            _ => 1,
+        };
+        last_hit = Some(pos);
+        hi = pos + 1;
+    }
+    // Earlier first-hit is slightly better.
+    score -= (last_hit.unwrap_or(0) as i32) / 8;
+    Some(score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_basics() {
+        assert!(fuzzy_score("", "anything").is_some());
+        assert!(fuzzy_score("tbl", "view: toggle json/table (v)").is_some());
+        assert!(fuzzy_score("zzz", "view: toggle").is_none());
+        // consecutive run outranks scattered subsequence
+        let a = fuzzy_score("theme", "theme: dark").unwrap();
+        let b = fuzzy_score("theme", "t h e m e scattered").unwrap();
+        assert!(a > b);
+    }
+
+    #[test]
+    fn palette_filters_and_ranks() {
+        let mut p = Palette::new(vec![
+            ("view: toggle json/table".into(), AppAction::ToggleView),
+            ("theme: dark".into(), AppAction::SetTheme("dark")),
+            ("theme: termius".into(), AppAction::SetTheme("termius")),
+        ]);
+        p.input = Input::with_text("theme");
+        p.refilter();
+        assert_eq!(p.filtered.len(), 2);
+        assert!(matches!(p.selected_action(), Some(AppAction::SetTheme(_))));
+    }
 }

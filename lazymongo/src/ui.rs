@@ -14,7 +14,7 @@ use crate::agg::{AggFocus, AggState};
 use crate::app::{App, ConnState, ExplorerRow, Pane, Screen, ViewMode};
 use crate::config::SavedConnection;
 use crate::modal::{
-    Confirm, ConnForm, DocView, IndexesView, JsonEditor, Modal, Prompt, QueryEditor,
+    Confirm, ConnForm, DocView, IndexesView, JsonEditor, Modal, Palette, Prompt, QueryEditor,
     CONN_FIELD_LABELS, QUERY_FIELD_LABELS,
 };
 use crate::util;
@@ -270,6 +270,13 @@ fn results_title(app: &App) -> String {
                 } else {
                     "+) "
                 });
+            }
+            if !app.results.search.is_empty() || app.results.searching {
+                t.push_str(&format!("/{}", app.results.search));
+                if app.results.searching {
+                    t.push('▏');
+                }
+                t.push(' ');
             }
             if app.results.loading {
                 t.push_str(spinner(app));
@@ -553,6 +560,12 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
                 ("esc", "close"),
             ],
             Modal::Prompt(_) => &[("type", "name"), ("↵", "ok"), ("esc", "cancel")],
+            Modal::Palette(_) => &[
+                ("type", "filter"),
+                ("↑↓", "move"),
+                ("↵", "run"),
+                ("esc", "close"),
+            ],
             Modal::Connections { .. } => &[
                 ("↑↓", "move"),
                 ("↵", "connect"),
@@ -574,6 +587,12 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
             Pane::Explorer if app.explorer.filtering => {
                 &[("type", "filter"), ("↵", "apply"), ("esc", "clear")]
             }
+            Pane::Results if app.results.searching => &[
+                ("type", "search"),
+                ("↵", "apply"),
+                ("n/N", "next/prev"),
+                ("esc", "clear"),
+            ],
             Pane::Explorer => &[
                 ("↑↓/jk", "move"),
                 ("↵", "expand/open"),
@@ -657,7 +676,53 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
         Modal::Prompt(prompt) => draw_prompt(f, f.area(), prompt),
         Modal::Connections { items, selected } => draw_connections(f, f.area(), items, *selected),
         Modal::ConnForm(form) => draw_conn_form(f, f.area(), form),
+        Modal::Palette(palette) => draw_palette(f, f.area(), palette),
     }
+}
+
+fn draw_palette(f: &mut Frame, area: Rect, palette: &Palette) {
+    let h = (palette.filtered.len() as u16 + 4).clamp(8, 20);
+    let popup = centered(area, 72, h);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::accent()))
+        .title(" Command palette ─ ↵ run · esc close ");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut prompt = vec![Span::styled(" > ", Style::new().fg(theme::marker()))];
+    prompt.extend(palette.input.spans(true));
+    lines.push(Line::from(prompt));
+    lines.push(Line::raw(""));
+
+    let visible = inner.height.saturating_sub(2) as usize;
+    let scroll = palette.selected.saturating_sub(visible.saturating_sub(1));
+    for (row, &idx) in palette
+        .filtered
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+    {
+        let (label, _) = &palette.actions[idx];
+        let mut line = Line::from(Span::styled(
+            format!("  {label}"),
+            Style::new().fg(theme::text()),
+        ));
+        if row == palette.selected {
+            line.style = Style::new().bg(theme::sel_bg());
+        }
+        lines.push(line);
+    }
+    if palette.filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching command",
+            Style::new().fg(theme::dim()),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn draw_connections(f: &mut Frame, area: Rect, items: &[SavedConnection], selected: usize) {
@@ -1205,6 +1270,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("tab / 1 2 3"), txt("switch pane")]),
         Line::from(vec![key("r"), txt("refresh current pane")]),
         Line::from(vec![key("C"), txt("connection manager (add/edit/switch)")]),
+        Line::from(vec![key("^p / :"), txt("command palette (incl. themes)")]),
         Line::from(vec![key("?"), txt("toggle this help")]),
         Line::raw(""),
         head("Explorer"),
@@ -1227,6 +1293,10 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
             txt("aggregation editor (stage-by-stage preview)"),
         ]),
         Line::from(vec![key("m"), txt("open mongosh on this connection")]),
+        Line::from(vec![
+            key("/ · n N"),
+            txt("search loaded results · next/prev match"),
+        ]),
         Line::from(vec![key("esc"), txt("cancel a running query")]),
         Line::raw(""),
         head("Writes (blocked in read-only mode)"),
