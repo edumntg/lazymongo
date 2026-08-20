@@ -84,6 +84,7 @@ impl Actor {
         }
         match cmd {
             Command::Connect { uri } => self.connect(uri).await,
+            Command::SetReadOnly(ro) => self.read_only = ro,
             Command::ListDatabases => self.list_databases().await,
             Command::ListCollections { db } => self.list_collections(db).await,
             Command::StartFind {

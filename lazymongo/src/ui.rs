@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, ConnState, ExplorerRow, Pane, ViewMode};
+use crate::agg::{AggFocus, AggState};
+use crate::app::{App, ConnState, ExplorerRow, Pane, Screen, ViewMode};
+use crate::config::SavedConnection;
 use crate::modal::{
     Confirm, DocView, IndexesView, JsonEditor, Modal, Prompt, QueryEditor, QUERY_FIELD_LABELS,
 };
@@ -25,6 +27,9 @@ fn focused_style(focused: bool) -> Style {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    if app.screen == Screen::Agg {
+        return draw_agg_screen(f, app);
+    }
     let [status, main, query, help] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
@@ -77,6 +82,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Style::new().fg(Color::White),
     ));
     match &app.conn {
+        ConnState::Idle => {}
         ConnState::Connecting => {
             spans.push(sep.clone());
             spans.push(Span::styled(
@@ -628,7 +634,212 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
         Modal::Indexes(view) => draw_indexes(f, f.area(), view, spin),
         Modal::OpsLog { scroll } => draw_ops_log(f, f.area(), &app.ops_log, scroll),
         Modal::Prompt(prompt) => draw_prompt(f, f.area(), prompt),
+        Modal::Connections { items, selected } => draw_connections(f, f.area(), items, *selected),
     }
+}
+
+fn draw_connections(f: &mut Frame, area: Rect, items: &[SavedConnection], selected: usize) {
+    let h = (items.len() as u16 + 4).clamp(6, 20);
+    let popup = centered(area, 58, h);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Green))
+        .title(" Connections ─ ↵ connect · q quit ");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, conn) in items.iter().enumerate() {
+        let ro = if conn.read_only { "  [read-only]" } else { "" };
+        let source = match (&conn.uri, &conn.uri_env) {
+            (Some(_), _) => String::new(),
+            (None, Some(var)) => format!("  ${var}"),
+            _ => "  (no uri!)".into(),
+        };
+        let mut line = Line::from(vec![
+            Span::styled(format!(" {} ", i + 1), Style::new().fg(Color::DarkGray)),
+            Span::styled(conn.name.clone(), Style::new().fg(Color::White)),
+            Span::styled(source, Style::new().fg(Color::DarkGray)),
+            Span::styled(ro, Style::new().fg(Color::Red)),
+        ]);
+        if i == selected {
+            line.style = Style::new().bg(Color::Blue);
+        }
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+// ---------- aggregation screen ----------
+
+fn draw_agg_screen(f: &mut Frame, app: &mut App) {
+    let [status, main, help] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(f.area());
+    draw_status(f, app, status);
+
+    // Help bar for the agg screen.
+    let entries: &[(&str, &str)] = match app.agg.as_ref().map(|a| a.focus) {
+        Some(AggFocus::Editor) => &[
+            ("type", "edit pipeline"),
+            ("^r", "run all"),
+            ("esc", "stages"),
+        ],
+        Some(AggFocus::Stages) => &[
+            ("↑↓", "stage"),
+            ("↵", "run to stage"),
+            ("^r", "run all"),
+            ("e", "edit"),
+            ("tab", "results"),
+            ("esc", "back"),
+        ],
+        _ => &[
+            ("↑↓/jk", "move"),
+            ("↵", "fold"),
+            ("y", "copy"),
+            ("esc", "stages"),
+        ],
+    };
+    let mut spans = Vec::new();
+    for (k, d) in entries {
+        spans.push(Span::styled(
+            format!(" {k} "),
+            Style::new().fg(Color::Black).bg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!(" {d}  "),
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), help);
+
+    let Some(agg) = &mut app.agg else { return };
+    let spin = SPINNER[app.spinner_frame % SPINNER.len()];
+
+    let [stages_a, right] =
+        Layout::horizontal([Constraint::Length(26), Constraint::Min(30)]).areas(main);
+    let [editor_a, results_a] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Min(5)]).areas(right);
+    agg.stages_area = stages_a;
+    agg.editor_area = editor_a;
+    agg.results_area = results_a;
+
+    draw_agg_stages(f, agg, stages_a);
+    draw_agg_editor(f, agg, editor_a);
+    draw_agg_results(f, agg, results_a, spin);
+}
+
+fn draw_agg_stages(f: &mut Frame, agg: &AggState, area: Rect) {
+    let focused = agg.focus == AggFocus::Stages;
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(focused_style(focused))
+        .title(format!(" Stages ─ {}.{} ", agg.db, agg.coll));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, name) in agg.stages.iter().enumerate() {
+        let ran = agg.ran_through.is_some_and(|r| i <= r);
+        let marker = if ran { "● " } else { "○ " };
+        let mut line = Line::from(vec![
+            Span::styled(
+                format!(" {marker}"),
+                Style::new().fg(if ran { Color::Green } else { Color::DarkGray }),
+            ),
+            Span::styled(format!("{} {name}", i + 1), Style::new().fg(Color::Cyan)),
+        ]);
+        if i == agg.selected_stage {
+            line.style = Style::new().bg(if focused {
+                Color::Blue
+            } else {
+                Color::DarkGray
+            });
+        }
+        lines.push(line);
+    }
+    if agg.stages.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (invalid pipeline)",
+            Style::new().fg(Color::Red),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn draw_agg_editor(f: &mut Frame, agg: &mut AggState, area: Rect) {
+    let focused = agg.focus == AggFocus::Editor;
+    let title = match &agg.error {
+        Some(e) => Line::from(vec![
+            Span::raw(" Pipeline ─ "),
+            Span::styled(e.clone(), Style::new().fg(Color::Red)),
+            Span::raw(" "),
+        ]),
+        None => Line::raw(" Pipeline (json5, ^r runs) "),
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(focused_style(focused))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    agg.editor.render(f, inner, focused);
+}
+
+fn draw_agg_results(f: &mut Frame, agg: &mut AggState, area: Rect, spin: &str) {
+    let focused = agg.focus == AggFocus::Results;
+    let mut title = match agg.ran_through {
+        Some(r) => format!(
+            " Preview ─ through stage {} ({} docs{}) ",
+            r + 1,
+            agg.docs.len(),
+            if agg.docs.len() >= crate::agg::AGG_PREVIEW_LIMIT {
+                ", capped"
+            } else {
+                ""
+            }
+        ),
+        None => " Preview ─ run the pipeline (↵ on a stage / ^r) ".to_string(),
+    };
+    if agg.running {
+        title.push_str(spin);
+        title.push(' ');
+    }
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(focused_style(focused))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let height = inner.height as usize;
+    let len = agg.lines.len();
+    if agg.cursor < agg.scroll {
+        agg.scroll = agg.cursor;
+    } else if height > 0 && agg.cursor >= agg.scroll + height {
+        agg.scroll = agg.cursor - height + 1;
+    }
+    agg.scroll = agg.scroll.min(len.saturating_sub(1));
+
+    let mut lines: Vec<Line> = Vec::with_capacity(height);
+    for (i, rline) in agg.lines.iter().enumerate().skip(agg.scroll).take(height) {
+        let mut line = rline.line.clone();
+        if focused && i == agg.cursor {
+            line.style = Style::new().bg(Color::Blue);
+        }
+        lines.push(line);
+    }
+    if len == 0 && !agg.running && agg.ran_through.is_some() {
+        lines.push(Line::from(Span::styled(
+            "  no documents produced",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn draw_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
@@ -903,6 +1114,10 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("o"), txt("open document full-screen")]),
         Line::from(vec![key("y"), txt("copy document to clipboard")]),
         Line::from(vec![key("E"), txt("export loaded docs (json / csv)")]),
+        Line::from(vec![
+            key("a"),
+            txt("aggregation editor (stage-by-stage preview)"),
+        ]),
         Line::raw(""),
         head("Writes (blocked in read-only mode)"),
         Line::from(vec![key("e / i"), txt("edit document · insert document")]),

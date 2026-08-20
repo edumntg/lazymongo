@@ -1,4 +1,6 @@
+mod agg;
 mod app;
+mod config;
 mod event;
 mod input;
 mod json_view;
@@ -51,8 +53,6 @@ async fn main() -> Result<()> {
             other => uri = Some(other.to_string()),
         }
     }
-    let uri = uri.unwrap_or_else(|| "mongodb://localhost:27017".to_string());
-
     term::install_panic_hook();
     let mut terminal = term::init()?;
     let result = app::run(&mut terminal, uri, read_only).await;

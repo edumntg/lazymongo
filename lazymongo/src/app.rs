@@ -17,6 +17,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use tokio::sync::mpsc;
 
+use crate::agg::{AggFocus, AggState, AGG_PREVIEW_LIMIT, DEFAULT_PIPELINE};
 use crate::input::{char_to_byte, Input};
 use crate::json_view::{doc_lines, RLine};
 use crate::modal::{
@@ -24,7 +25,7 @@ use crate::modal::{
     PromptAction, QueryEditor,
 };
 use crate::textarea::TextArea;
-use crate::{event, term, ui, util};
+use crate::{config, event, term, ui, util};
 
 /// Memory cap: max documents held in the sliding window (NFR-3).
 pub const MAX_DOCS: usize = 2000;
@@ -46,9 +47,20 @@ pub enum ViewMode {
 }
 
 pub enum ConnState {
+    /// No connection yet (saved-connection picker is open).
+    Idle,
     Connecting,
-    Connected { version: String, ping_ms: u64 },
+    Connected {
+        version: String,
+        ping_ms: u64,
+    },
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Main,
+    Agg,
 }
 
 pub struct DbNode {
@@ -237,8 +249,15 @@ pub struct App {
     pub query: QueryBar,
     pub extras: SpecExtras,
     pub modal: Modal,
+    pub screen: Screen,
+    /// Aggregation screen state; kept across visits within a session.
+    pub agg: Option<AggState>,
+    /// Persisted per-collection history and pipelines (FR-13/FR-19).
+    pub state: config::State,
     /// Session log of completed write operations (FR-32).
     pub ops_log: Vec<String>,
+    /// The --readonly CLI flag (a saved connection can only add to it).
+    cli_read_only: bool,
     pending_counts: HashMap<u64, PendingCount>,
     next_req_id: u64,
     pub toast: Option<(String, bool, Instant)>, // (message, is_error, when)
@@ -265,7 +284,11 @@ impl App {
             query: QueryBar::default(),
             extras: SpecExtras::default(),
             modal: Modal::None,
+            screen: Screen::Main,
+            agg: None,
+            state: config::load_state(),
             ops_log: Vec::new(),
+            cli_read_only: read_only,
             pending_counts: HashMap::new(),
             next_req_id: 0,
             toast: None,
@@ -407,8 +430,15 @@ impl App {
                     }
                 }
             }
-            // Aggregations arrive with M4.
-            CoreEvent::AggBatch { .. } => {}
+            CoreEvent::AggBatch { generation, docs } => {
+                if generation != self.generation {
+                    return;
+                }
+                if let Some(agg) = &mut self.agg {
+                    let ran_through = agg.selected_stage;
+                    agg.set_docs(docs, ran_through);
+                }
+            }
         }
     }
 
@@ -477,6 +507,9 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
+        }
+        if self.screen == Screen::Agg {
+            return self.on_key_agg(key);
         }
         if self.modal.is_open() {
             return self.on_key_modal(key);
@@ -640,6 +673,43 @@ impl App {
                     prompt.input.on_key(key);
                 }
             },
+            Modal::Connections { items, selected } => match key.code {
+                // Nothing behind the picker: Esc/q quit the app.
+                KeyCode::Esc | KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = (*selected + 1).min(items.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Enter => self.connect_selected(),
+                KeyCode::Char(c @ '1'..='9') => {
+                    let idx = (c as usize) - ('1' as usize);
+                    if idx < items.len() {
+                        *selected = idx;
+                        self.connect_selected();
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Connect to the highlighted saved connection (FR-2/FR-4).
+    fn connect_selected(&mut self) {
+        let Modal::Connections { items, selected } = &self.modal else {
+            return;
+        };
+        let conn = items[*selected].clone();
+        match conn.resolve_uri() {
+            Err(e) => self.toast_err(e),
+            Ok(uri) => {
+                let effective_ro = self.cli_read_only || conn.read_only;
+                self.read_only = effective_ro;
+                self.uri_display = format!("{} ({})", conn.name, redact_uri(&uri));
+                self.conn = ConnState::Connecting;
+                self.modal = Modal::None;
+                self.send(Command::SetReadOnly(effective_ro));
+                self.send(Command::Connect { uri });
+            }
         }
     }
 
@@ -929,6 +999,18 @@ impl App {
 
     fn start_find(&mut self, db: String, coll: String, spec: FindSpec) {
         self.generation += 1;
+        // Load persisted history when switching collections (FR-13).
+        let ns = format!("{db}.{coll}");
+        if self
+            .results
+            .target
+            .as_ref()
+            .map(|(d, c)| format!("{d}.{c}"))
+            != Some(ns.clone())
+        {
+            self.query.history = self.state.history.get(&ns).cloned().unwrap_or_default();
+            self.query.hist_pos = None;
+        }
         let r = &mut self.results;
         r.target = Some((db.clone(), coll.clone()));
         r.docs.clear();
@@ -1146,6 +1228,7 @@ impl App {
                 self.modal = Modal::OpsLog { scroll: 0 };
                 return;
             }
+            KeyCode::Char('a') => return self.open_agg(),
             _ => {}
         }
         match self.view {
@@ -1253,6 +1336,129 @@ impl App {
             area: TextArea::from_text("{\n  $set: {\n    \n  }\n}"),
             purpose: EditorPurpose::UpdateMany { filter },
             error: None,
+        });
+    }
+
+    // ---------- aggregation screen (M4) ----------
+
+    fn open_agg(&mut self) {
+        let Some((db, coll)) = self.results.target.clone() else {
+            self.toast_err("select a collection first".into());
+            return;
+        };
+        let ns = format!("{db}.{coll}");
+        let reuse = self
+            .agg
+            .as_ref()
+            .is_some_and(|a| a.db == db && a.coll == coll);
+        if !reuse {
+            let initial = self
+                .state
+                .pipelines
+                .get(&ns)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_PIPELINE.to_string());
+            self.agg = Some(AggState::new(db, coll, initial));
+        }
+        self.screen = Screen::Agg;
+    }
+
+    fn on_key_agg(&mut self, key: KeyEvent) {
+        // Ctrl-R runs the full pipeline from any focus.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            self.run_agg(None);
+            return;
+        }
+        let Some(agg) = &mut self.agg else {
+            self.screen = Screen::Main;
+            return;
+        };
+        match agg.focus {
+            AggFocus::Editor => match key.code {
+                KeyCode::Esc => {
+                    agg.focus = AggFocus::Stages;
+                    agg.parse();
+                }
+                _ => {
+                    if agg.editor.on_key(key) {
+                        agg.error = None;
+                    }
+                }
+            },
+            AggFocus::Stages => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Main,
+                KeyCode::Tab => agg.focus = AggFocus::Results,
+                KeyCode::Char('e') | KeyCode::Char('i') => agg.focus = AggFocus::Editor,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    agg.selected_stage =
+                        (agg.selected_stage + 1).min(agg.stages.len().saturating_sub(1));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    agg.selected_stage = agg.selected_stage.saturating_sub(1);
+                }
+                KeyCode::Enter => {
+                    let upto = agg.selected_stage;
+                    self.run_agg(Some(upto));
+                }
+                _ => {}
+            },
+            AggFocus::Results => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::BackTab => {
+                    agg.focus = AggFocus::Stages
+                }
+                KeyCode::Tab => agg.focus = AggFocus::Editor,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    agg.cursor = (agg.cursor + 1).min(agg.lines.len().saturating_sub(1));
+                }
+                KeyCode::Up | KeyCode::Char('k') => agg.cursor = agg.cursor.saturating_sub(1),
+                KeyCode::Char('g') | KeyCode::Home => agg.cursor = 0,
+                KeyCode::Char('G') | KeyCode::End => agg.cursor = agg.lines.len().saturating_sub(1),
+                KeyCode::Enter | KeyCode::Char(' ') => agg.toggle_fold_at_cursor(),
+                KeyCode::Char('y') => {
+                    let doc = agg
+                        .lines
+                        .get(agg.cursor)
+                        .map(|l| l.doc_idx)
+                        .and_then(|i| agg.docs.get(i))
+                        .cloned();
+                    if let Some(doc) = doc {
+                        match util::clipboard_copy(&util::doc_to_pretty(&doc)) {
+                            Ok(()) => self.toast_info("document copied".into()),
+                            Err(e) => self.toast_err(e),
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Run the pipeline; `upto` = run only stages 0..=upto (FR-18).
+    fn run_agg(&mut self, upto: Option<usize>) {
+        let Some(agg) = &mut self.agg else { return };
+        let Some(mut stages) = agg.parse() else {
+            return;
+        };
+        let upto = upto.unwrap_or(stages.len() - 1).min(stages.len() - 1);
+        stages.truncate(upto + 1);
+        agg.selected_stage = upto;
+        agg.running = true;
+        let ns = format!("{}.{}", agg.db, agg.coll);
+        let pipeline_text = agg.editor.text();
+        let (db, coll) = (agg.db.clone(), agg.coll.clone());
+        // Persist the pipeline text per collection (FR-19).
+        self.state.pipelines.insert(ns, pipeline_text);
+        if let Err(e) = config::save_state(&self.state) {
+            self.toast_err(format!("could not save state: {e}"));
+        }
+        self.generation += 1;
+        let generation = self.generation;
+        self.send(Command::Aggregate {
+            generation,
+            db,
+            coll,
+            pipeline: stages,
+            limit: AGG_PREVIEW_LIMIT,
         });
     }
 
@@ -1549,7 +1755,13 @@ impl App {
     fn push_history(&mut self) {
         let text = self.query.input.trim().to_string();
         if !text.is_empty() && self.query.history.last() != Some(&text) {
-            self.query.history.push(text);
+            self.query.history.push(text.clone());
+            // Persist per collection (FR-13).
+            if let Some((db, coll)) = &self.results.target {
+                let ns = format!("{db}.{coll}");
+                self.state.push_history(&ns, text);
+                let _ = config::save_state(&self.state);
+            }
         }
         self.query.hist_pos = None;
     }
@@ -1583,6 +1795,29 @@ impl App {
             x: m.column,
             y: m.row,
         };
+        if self.screen == Screen::Agg {
+            if let Some(agg) = &mut self.agg {
+                match m.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if agg.stages_area.contains(pos) {
+                            agg.focus = AggFocus::Stages;
+                        } else if agg.editor_area.contains(pos) {
+                            agg.focus = AggFocus::Editor;
+                        } else if agg.results_area.contains(pos) {
+                            agg.focus = AggFocus::Results;
+                        }
+                    }
+                    MouseEventKind::ScrollDown if agg.results_area.contains(pos) => {
+                        agg.scroll = (agg.scroll + 3).min(agg.lines.len().saturating_sub(1));
+                    }
+                    MouseEventKind::ScrollUp if agg.results_area.contains(pos) => {
+                        agg.scroll = agg.scroll.saturating_sub(3);
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         if self.modal.is_open() {
             match (&mut self.modal, m.kind) {
                 (Modal::Help, MouseEventKind::Down(_)) => self.modal = Modal::None,
@@ -1793,11 +2028,36 @@ pub fn redact_uri(uri: &str) -> String {
 }
 
 /// Main event loop: draw, then wait for the next input/core/tick event.
-pub async fn run(terminal: &mut term::Term, uri: String, read_only: bool) -> Result<()> {
+pub async fn run(terminal: &mut term::Term, uri: Option<String>, read_only: bool) -> Result<()> {
     let (cmd_tx, mut core_rx) = actor::spawn(read_only);
     let mut input_rx = event::input_channel();
-    let mut app = App::new(redact_uri(&uri), cmd_tx, read_only);
-    app.send(Command::Connect { uri });
+    let mut app = App::new(String::new(), cmd_tx, read_only);
+
+    match uri {
+        Some(uri) => {
+            app.uri_display = redact_uri(&uri);
+            app.send(Command::Connect { uri });
+        }
+        None => match config::load_config() {
+            Err(e) => {
+                app.uri_display = "config error".into();
+                app.conn = ConnState::Failed(e);
+            }
+            Ok(cfg) if !cfg.connections.is_empty() => {
+                app.conn = ConnState::Idle;
+                app.uri_display = "select a connection".into();
+                app.modal = Modal::Connections {
+                    items: cfg.connections,
+                    selected: 0,
+                };
+            }
+            Ok(_) => {
+                let uri = "mongodb://localhost:27017".to_string();
+                app.uri_display = redact_uri(&uri);
+                app.send(Command::Connect { uri });
+            }
+        },
+    }
 
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -39,6 +39,8 @@ pub enum Command {
     Connect {
         uri: String,
     },
+    /// Toggle read-only enforcement (used by the connection picker).
+    SetReadOnly(bool),
     ListDatabases,
     ListCollections {
         db: String,

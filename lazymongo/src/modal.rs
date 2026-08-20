@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use lazymongo_core::bson::{Bson, Document};
 use lazymongo_core::types::IndexInfo;
 
+use crate::config::SavedConnection;
 use crate::input::Input;
 use crate::json_view::{doc_lines, RLine};
 use crate::textarea::TextArea;
@@ -17,8 +18,15 @@ pub enum Modal {
     Confirm(Confirm),
     Editor(JsonEditor),
     Indexes(IndexesView),
-    OpsLog { scroll: usize },
+    OpsLog {
+        scroll: usize,
+    },
     Prompt(Prompt),
+    /// Saved-connection picker shown at startup when no URI was given (FR-2).
+    Connections {
+        items: Vec<SavedConnection>,
+        selected: usize,
+    },
 }
 
 impl Modal {
