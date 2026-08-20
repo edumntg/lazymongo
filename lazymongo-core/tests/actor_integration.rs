@@ -10,17 +10,40 @@ use lazymongo_core::query::{parse_filter, parse_pipeline};
 use lazymongo_core::types::{Command, CoreEvent, FindSpec, BATCH_SIZE};
 use tokio::time::timeout;
 
-/// Receive the next non-Ping event (health pings can arrive at any time).
+/// Receive the next event, skipping background noise: health pings and the
+/// asynchronously streamed collection counts.
 async fn recv(rx: &mut tokio::sync::mpsc::Receiver<CoreEvent>) -> CoreEvent {
     loop {
         let ev = timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("timed out waiting for core event")
             .expect("actor channel closed");
-        if !matches!(ev, CoreEvent::Ping { .. }) {
+        if !matches!(
+            ev,
+            CoreEvent::Ping { .. } | CoreEvent::CollectionCount { .. }
+        ) {
             return ev;
         }
     }
+}
+
+/// Gather streamed counts (they arrive in completion order, not name order)
+/// until every wanted collection has one.
+async fn recv_counts(
+    rx: &mut tokio::sync::mpsc::Receiver<CoreEvent>,
+    wanted: &[&str],
+) -> std::collections::HashMap<String, u64> {
+    let mut got = std::collections::HashMap::new();
+    while wanted.iter().any(|w| !got.contains_key(*w)) {
+        let ev = timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timed out waiting for collection counts")
+            .expect("actor channel closed");
+        if let CoreEvent::CollectionCount { coll, count, .. } = ev {
+            got.insert(coll, count);
+        }
+    }
+    got
 }
 
 fn test_uri() -> Option<String> {
@@ -130,6 +153,12 @@ async fn browse_and_query_flow() {
         names.contains(&"users") && names.contains(&"orders"),
         "{names:?}"
     );
+    // Names arrive with counts unset; the counts stream in afterwards,
+    // in completion order.
+    assert!(colls.iter().all(|c| c.estimated_count.is_none()));
+    let counts = recv_counts(&mut evt, &["users", "orders"]).await;
+    assert_eq!(counts.get("users"), Some(&500));
+    assert_eq!(counts.get("orders"), Some(&75));
 
     // Unfiltered find: first batch + estimate, then page to exhaustion.
     cmd.send(Command::StartFind {

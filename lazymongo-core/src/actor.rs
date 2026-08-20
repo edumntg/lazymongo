@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use mongodb::bson::{doc, Bson, Document};
 use mongodb::options::ClientOptions;
 use mongodb::{Client, Cursor, IndexModel};
@@ -20,6 +20,8 @@ const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Server-side guardrails (FR-16).
 const FIND_MAX_TIME: Duration = Duration::from_secs(30);
 const COUNT_MAX_TIME: Duration = Duration::from_secs(15);
+/// Concurrent estimated-count commands while filling the sidebar.
+const COUNT_CONCURRENCY: usize = 10;
 
 /// Spawn the actor on the current tokio runtime.
 /// `read_only` rejects every write command at the I/O layer (FR-4).
@@ -243,25 +245,54 @@ impl Actor {
         }
     }
 
+    /// One round-trip for the names (sent immediately so the sidebar fills
+    /// instantly), then estimated counts fan out concurrently from a detached
+    /// task and stream back one CollectionCount event each. This keeps the
+    /// cost independent of collection count x network latency and never
+    /// blocks the actor.
     async fn list_collections(&mut self, db: String) {
         let Some(client) = &self.client else { return };
         let database = client.database(&db);
         match database.list_collection_names().await {
             Ok(mut names) => {
                 names.sort();
-                let mut colls = Vec::with_capacity(names.len());
-                for name in names {
-                    let count = database
-                        .collection::<Document>(&name)
-                        .estimated_document_count()
-                        .await
-                        .ok();
-                    colls.push(CollectionInfo {
-                        name,
-                        estimated_count: count,
-                    });
-                }
-                Self::emit(&self.events, CoreEvent::Collections { db, colls }).await;
+                let colls = names
+                    .iter()
+                    .map(|name| CollectionInfo {
+                        name: name.clone(),
+                        estimated_count: None,
+                    })
+                    .collect();
+                Self::emit(
+                    &self.events,
+                    CoreEvent::Collections {
+                        db: db.clone(),
+                        colls,
+                    },
+                )
+                .await;
+
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let mut counts = futures_util::stream::iter(names.into_iter().map(|name| {
+                        let coll = database.collection::<Document>(&name);
+                        async move { (name, coll.estimated_document_count().await.ok()) }
+                    }))
+                    .buffer_unordered(COUNT_CONCURRENCY);
+                    while let Some((coll, count)) = counts.next().await {
+                        // Errors (e.g. views don't support the count) just
+                        // leave the count blank in the sidebar.
+                        if let Some(count) = count {
+                            let _ = events
+                                .send(CoreEvent::CollectionCount {
+                                    db: db.clone(),
+                                    coll,
+                                    count,
+                                })
+                                .await;
+                        }
+                    }
+                });
             }
             Err(e) => Self::emit_err(&self.events, format!("listCollections({db}): {e}")).await,
         }

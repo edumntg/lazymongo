@@ -160,9 +160,17 @@ pub enum CoreEvent {
     },
     ConnectFailed(String),
     Databases(Vec<DatabaseInfo>),
+    /// Collection names, sent immediately after listCollections (counts
+    /// arrive separately, see [`CoreEvent::CollectionCount`]).
     Collections {
         db: String,
         colls: Vec<CollectionInfo>,
+    },
+    /// One estimated count, streamed as the background fan-out completes.
+    CollectionCount {
+        db: String,
+        coll: String,
+        count: u64,
     },
     /// One page of query results.
     Batch {

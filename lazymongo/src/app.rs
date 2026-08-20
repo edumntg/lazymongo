@@ -377,6 +377,13 @@ impl App {
                     node.loading = false;
                 }
             }
+            CoreEvent::CollectionCount { db, coll, count } => {
+                if let Some(node) = self.explorer.dbs.iter_mut().find(|n| n.info.name == db) {
+                    if let Some(c) = node.colls.iter_mut().flatten().find(|c| c.name == coll) {
+                        c.estimated_count = Some(count);
+                    }
+                }
+            }
             CoreEvent::Batch {
                 generation,
                 docs,

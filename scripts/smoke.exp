@@ -29,7 +29,7 @@ sleep 1
 # Expand first doc
 send "\r"
 expect {
-    "createdAt" { send_user "\n=== SAW expanded doc ===\n" }
+    "tags" { send_user "\n=== SAW expanded doc ===\n" }
     timeout { send_user "\nTIMEOUT waiting for expanded doc\n"; exit 1 }
 }
 # Jump to query pane and run a filter
