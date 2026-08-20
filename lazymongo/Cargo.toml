@@ -1,0 +1,13 @@
+[package]
+name = "lazymongo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A fast, lightweight terminal UI for MongoDB"
+
+[dependencies]
+lazymongo-core = { path = "../lazymongo-core" }
+anyhow.workspace = true
+tokio.workspace = true
+ratatui = "0.29"
