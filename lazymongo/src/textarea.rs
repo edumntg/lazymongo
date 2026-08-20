@@ -3,7 +3,9 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
+
+use crate::theme;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -164,7 +166,7 @@ impl TextArea {
         {
             let mut spans = vec![Span::styled(
                 format!("{:>num_w$} ", i + 1),
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(theme::dim()),
             )];
             let chars: Vec<char> = line.chars().collect();
             let visible: Vec<char> = chars

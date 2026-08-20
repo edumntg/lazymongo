@@ -7,7 +7,9 @@
 use std::collections::HashSet;
 
 use lazymongo_core::bson::{Bson, Document};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
+
+use crate::theme;
 use ratatui::text::{Line, Span};
 
 /// One rendered line of the results pane.
@@ -23,13 +25,13 @@ const MAX_SUMMARY_FIELDS: usize = 4;
 const MAX_INLINE_STR: usize = 32;
 
 fn key_style() -> Style {
-    Style::new().fg(Color::Cyan)
+    Style::new().fg(theme::key())
 }
 fn punct_style() -> Style {
-    Style::new().fg(Color::DarkGray)
+    Style::new().fg(theme::dim())
 }
 fn marker_style() -> Style {
-    Style::new().fg(Color::Yellow)
+    Style::new().fg(theme::marker())
 }
 
 fn value_span(v: &Bson) -> Span<'static> {
@@ -39,36 +41,36 @@ fn value_span(v: &Bson) -> Span<'static> {
             if s.chars().count() > MAX_INLINE_STR {
                 s = s.chars().take(MAX_INLINE_STR).collect::<String>() + "…";
             }
-            Span::styled(format!("\"{s}\""), Style::new().fg(Color::Green))
+            Span::styled(format!("\"{s}\""), Style::new().fg(theme::string()))
         }
-        Bson::Int32(n) => Span::styled(n.to_string(), Style::new().fg(Color::Yellow)),
-        Bson::Int64(n) => Span::styled(n.to_string(), Style::new().fg(Color::Yellow)),
-        Bson::Double(n) => Span::styled(n.to_string(), Style::new().fg(Color::Yellow)),
-        Bson::Decimal128(n) => Span::styled(n.to_string(), Style::new().fg(Color::Yellow)),
-        Bson::Boolean(b) => Span::styled(b.to_string(), Style::new().fg(Color::Magenta)),
-        Bson::Null => Span::styled("null", Style::new().fg(Color::Magenta)),
+        Bson::Int32(n) => Span::styled(n.to_string(), Style::new().fg(theme::number())),
+        Bson::Int64(n) => Span::styled(n.to_string(), Style::new().fg(theme::number())),
+        Bson::Double(n) => Span::styled(n.to_string(), Style::new().fg(theme::number())),
+        Bson::Decimal128(n) => Span::styled(n.to_string(), Style::new().fg(theme::number())),
+        Bson::Boolean(b) => Span::styled(b.to_string(), Style::new().fg(theme::keyword())),
+        Bson::Null => Span::styled("null", Style::new().fg(theme::keyword())),
         Bson::ObjectId(oid) => Span::styled(
             format!("ObjectId(\"{oid}\")"),
-            Style::new().fg(Color::LightMagenta),
+            Style::new().fg(theme::object_id()),
         ),
         Bson::DateTime(dt) => Span::styled(
             dt.try_to_rfc3339_string()
                 .unwrap_or_else(|_| format!("{dt}")),
-            Style::new().fg(Color::Blue),
+            Style::new().fg(theme::date()),
         ),
         Bson::Binary(b) => Span::styled(
             format!("Binary({:?}, {} bytes)", b.subtype, b.bytes.len()),
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         ),
         Bson::RegularExpression(r) => Span::styled(
             format!("/{}/{}", r.pattern, r.options),
-            Style::new().fg(Color::Red),
+            Style::new().fg(theme::error()),
         ),
         Bson::Timestamp(t) => Span::styled(
             format!("Timestamp({}, {})", t.time, t.increment),
-            Style::new().fg(Color::Blue),
+            Style::new().fg(theme::date()),
         ),
-        other => Span::styled(format!("{other}"), Style::new().fg(Color::White)),
+        other => Span::styled(format!("{other}"), Style::new().fg(theme::text())),
     }
 }
 
@@ -90,7 +92,7 @@ pub fn doc_lines(
     folds: &HashSet<String>,
 ) -> Vec<RLine> {
     let mut out = Vec::new();
-    let header_num = Span::styled(format!("[{number}] "), Style::new().fg(Color::DarkGray));
+    let header_num = Span::styled(format!("[{number}] "), Style::new().fg(theme::dim()));
 
     if folds.contains("") {
         // Collapsed card: ▸ [n] { _id: …, name: "…", … }

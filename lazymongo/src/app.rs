@@ -261,6 +261,8 @@ pub struct App {
     pending_counts: HashMap<u64, PendingCount>,
     next_req_id: u64,
     cancel_tx: watch::Sender<u64>,
+    /// Theme name persisted in config.toml (None = default).
+    pub config_theme: Option<String>,
     /// The real (unredacted) URI of the active connection, for `m` (mongosh).
     active_uri: Option<String>,
     /// Set by the `m` key; the run loop suspends the TUI and opens mongosh.
@@ -302,6 +304,7 @@ impl App {
             pending_counts: HashMap::new(),
             next_req_id: 0,
             cancel_tx,
+            config_theme: None,
             active_uri: None,
             pending_shell: false,
             toast: None,
@@ -795,7 +798,11 @@ impl App {
                 items.len() - 1
             }
         };
-        match config::save_connections(&items) {
+        let cfg = config::Config {
+            theme: self.config_theme.clone(),
+            connections: items.clone(),
+        };
+        match config::save_config(&cfg) {
             Ok(()) => {
                 self.toast_info("connections saved".into());
                 self.modal = Modal::Connections { items, selected };
@@ -921,7 +928,11 @@ impl App {
             }
             PendingAction::DeleteConnection { mut items, index } => {
                 let name = items.remove(index).name;
-                match config::save_connections(&items) {
+                let cfg = config::Config {
+                    theme: self.config_theme.clone(),
+                    connections: items.clone(),
+                };
+                match config::save_config(&cfg) {
                     Ok(()) => self.toast_info(format!("removed connection \"{name}\"")),
                     Err(e) => self.toast_err(format!("could not save: {e}")),
                 }
@@ -2207,6 +2218,7 @@ pub async fn run(terminal: &mut term::Term, uri: Option<String>, read_only: bool
     let (cmd_tx, mut core_rx, cancel_tx) = actor::spawn(read_only);
     let mut input_rx = event::input_channel();
     let mut app = App::new(String::new(), cmd_tx, cancel_tx, read_only);
+    app.config_theme = config::load_config().ok().and_then(|c| c.theme);
 
     match uri {
         Some(uri) => {

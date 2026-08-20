@@ -3,7 +3,9 @@
 
 use lazymongo_core::types::CollectionInfo;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
+
+use crate::theme;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
@@ -21,9 +23,9 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 fn focused_style(focused: bool) -> Style {
     if focused {
-        Style::new().fg(Color::Cyan)
+        Style::new().fg(theme::accent())
     } else {
-        Style::new().fg(Color::DarkGray)
+        Style::new().fg(theme::border_dim())
     }
 }
 
@@ -60,27 +62,27 @@ fn spinner(app: &App) -> &'static str {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let sep = Span::styled("  •  ", Style::new().fg(Color::DarkGray));
+    let sep = Span::styled("  •  ", Style::new().fg(theme::dim()));
     let mut spans = vec![Span::styled(
         " lazymongo ",
         Style::new()
-            .fg(Color::Black)
-            .bg(Color::Green)
+            .fg(theme::badge_fg())
+            .bg(theme::accent())
             .add_modifier(Modifier::BOLD),
     )];
     if app.read_only {
         spans.push(Span::styled(
             " RO ",
             Style::new()
-                .fg(Color::White)
-                .bg(Color::Red)
+                .fg(theme::badge_fg())
+                .bg(theme::error())
                 .add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         app.uri_display.clone(),
-        Style::new().fg(Color::White),
+        Style::new().fg(theme::text()),
     ));
     match &app.conn {
         ConnState::Idle => {}
@@ -88,26 +90,26 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             spans.push(sep.clone());
             spans.push(Span::styled(
                 format!("{} connecting…", spinner(app)),
-                Style::new().fg(Color::Yellow),
+                Style::new().fg(theme::warn()),
             ));
         }
         ConnState::Connected { version, ping_ms } => {
             spans.push(sep.clone());
             spans.push(Span::styled(
                 format!("MongoDB {version}"),
-                Style::new().fg(Color::Green),
+                Style::new().fg(theme::ok()),
             ));
             spans.push(sep.clone());
             spans.push(Span::styled(
                 format!("{ping_ms}ms"),
-                Style::new().fg(Color::Green),
+                Style::new().fg(theme::ok()),
             ));
         }
         ConnState::Failed(e) => {
             spans.push(sep.clone());
             spans.push(Span::styled(
                 format!("connection failed: {e}"),
-                Style::new().fg(Color::Red),
+                Style::new().fg(theme::error()),
             ));
         }
     }
@@ -115,7 +117,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         spans.push(sep);
         spans.push(Span::styled(
             msg.clone(),
-            Style::new().fg(if *is_err { Color::Red } else { Color::Yellow }),
+            Style::new().fg(if *is_err {
+                theme::error()
+            } else {
+                theme::warn()
+            }),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -189,20 +195,20 @@ fn draw_explorer(f: &mut Frame, app: &mut App, area: Rect) {
                 let node = &app.explorer.dbs[di];
                 let marker = if node.expanded { "▾ " } else { "▸ " };
                 let mut spans = vec![
-                    Span::styled(marker, Style::new().fg(Color::Yellow)),
+                    Span::styled(marker, Style::new().fg(theme::warn())),
                     Span::styled(
                         node.info.name.clone(),
-                        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::new().fg(theme::text()).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("  {}", human_size(node.info.size_on_disk)),
-                        Style::new().fg(Color::DarkGray),
+                        Style::new().fg(theme::dim()),
                     ),
                 ];
                 if node.loading {
                     spans.push(Span::styled(
                         format!(" {}", spinner(app)),
-                        Style::new().fg(Color::Yellow),
+                        Style::new().fg(theme::warn()),
                     ));
                 }
                 Line::from(spans)
@@ -215,16 +221,16 @@ fn draw_explorer(f: &mut Frame, app: &mut App, area: Rect) {
                     .unwrap_or_default();
                 Line::from(vec![
                     Span::raw("   "),
-                    Span::styled(c.name.clone(), Style::new().fg(Color::Cyan)),
-                    Span::styled(count, Style::new().fg(Color::DarkGray)),
+                    Span::styled(c.name.clone(), Style::new().fg(theme::key())),
+                    Span::styled(count, Style::new().fg(theme::dim())),
                 ])
             }
         };
         if selected {
             line.style = Style::new().bg(if focused {
-                Color::Blue
+                theme::sel_bg()
             } else {
-                Color::DarkGray
+                theme::sel_bg_dim()
             });
         }
         lines.push(line);
@@ -232,7 +238,7 @@ fn draw_explorer(f: &mut Frame, app: &mut App, area: Rect) {
     if rows.is_empty() && !app.explorer.loading {
         lines.push(Line::from(Span::styled(
             "  no databases",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -288,11 +294,11 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
             Line::raw(""),
             Line::from(Span::styled(
                 "  Select a collection in the Explorer to browse documents.",
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(theme::dim()),
             )),
             Line::from(Span::styled(
                 "  Press ? for all keybindings.",
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(theme::dim()),
             )),
         ]));
         f.render_widget(hint, inner);
@@ -329,9 +335,9 @@ fn draw_results_json(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
         let mut line = rline.line.clone();
         if i == app.results.cursor {
             line.style = Style::new().bg(if focused {
-                Color::Blue
+                theme::sel_bg()
             } else {
-                Color::DarkGray
+                theme::sel_bg_dim()
             });
         }
         lines.push(line);
@@ -339,7 +345,7 @@ fn draw_results_json(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
     if len == 0 && !app.results.loading {
         lines.push(Line::from(Span::styled(
             "  no documents match",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -412,10 +418,10 @@ fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) 
         let label = pad_cell(&format!("{col}{arrow}"), w);
         let style = if i == t.active_col && focused {
             Style::new()
-                .fg(Color::Yellow)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::new().fg(theme::key()).add_modifier(Modifier::BOLD)
         };
         header_spans.push(Span::styled(label, style));
         header_spans.push(Span::raw(" "));
@@ -446,9 +452,9 @@ fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) 
                 .map(util::bson_to_compact)
                 .unwrap_or_default();
             let style = if i == t.active_col && focused {
-                Style::new().fg(Color::White)
+                Style::new().fg(theme::text()).add_modifier(Modifier::BOLD)
             } else {
-                Style::new().fg(Color::Gray)
+                Style::new().fg(theme::text())
             };
             spans.push(Span::styled(pad_cell(&cell, w), style));
             spans.push(Span::raw(" "));
@@ -457,9 +463,9 @@ fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) 
         let mut line = Line::from(spans);
         if ri == t.row {
             line.style = Style::new().bg(if focused {
-                Color::Blue
+                theme::sel_bg()
             } else {
-                Color::DarkGray
+                theme::sel_bg_dim()
             });
         }
         lines.push(line);
@@ -467,7 +473,7 @@ fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) 
     if rows == 0 && !app.results.loading {
         lines.push(Line::from(Span::styled(
             "  no documents match",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -479,13 +485,13 @@ fn draw_query(f: &mut Frame, app: &App, area: Rect) {
     if !app.extras.is_default() {
         title_spans.push(Span::styled(
             "+projection/sort/limit — F to edit ",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::warn()),
         ));
     }
     if let Some(e) = &app.query.error {
         title_spans = vec![
             Span::raw(" 3 Query ─ "),
-            Span::styled(e.clone(), Style::new().fg(Color::Red)),
+            Span::styled(e.clone(), Style::new().fg(theme::error())),
             Span::raw(" "),
         ];
     }
@@ -496,7 +502,7 @@ fn draw_query(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut spans = vec![Span::styled("filter> ", Style::new().fg(Color::Yellow))];
+    let mut spans = vec![Span::styled("filter> ", Style::new().fg(theme::warn()))];
     if focused {
         // Render a visible cursor by splitting the input at the cursor column.
         let chars: Vec<char> = app.query.input.chars().collect();
@@ -614,11 +620,11 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
     for (key, desc) in entries {
         spans.push(Span::styled(
             format!(" {key} "),
-            Style::new().fg(Color::Black).bg(Color::DarkGray),
+            Style::new().fg(theme::badge_fg()).bg(theme::border_dim()),
         ));
         spans.push(Span::styled(
             format!(" {desc}  "),
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -660,7 +666,7 @@ fn draw_connections(f: &mut Frame, area: Rect, items: &[SavedConnection], select
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Green))
+        .border_style(Style::new().fg(theme::accent()))
         .title(" Connections ─ ↵ connect · a add · e edit · d delete ");
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -669,7 +675,7 @@ fn draw_connections(f: &mut Frame, area: Rect, items: &[SavedConnection], select
     if items.is_empty() {
         lines.push(Line::from(Span::styled(
             " no saved connections — press a to add one",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )));
     }
     for (i, conn) in items.iter().enumerate() {
@@ -680,13 +686,13 @@ fn draw_connections(f: &mut Frame, area: Rect, items: &[SavedConnection], select
             _ => "  (no uri!)".into(),
         };
         let mut line = Line::from(vec![
-            Span::styled(format!(" {} ", i + 1), Style::new().fg(Color::DarkGray)),
-            Span::styled(conn.name.clone(), Style::new().fg(Color::White)),
-            Span::styled(source, Style::new().fg(Color::DarkGray)),
-            Span::styled(ro, Style::new().fg(Color::Red)),
+            Span::styled(format!(" {} ", i + 1), Style::new().fg(theme::dim())),
+            Span::styled(conn.name.clone(), Style::new().fg(theme::text())),
+            Span::styled(source, Style::new().fg(theme::dim())),
+            Span::styled(ro, Style::new().fg(theme::error())),
         ]);
         if i == selected {
-            line.style = Style::new().bg(Color::Blue);
+            line.style = Style::new().bg(theme::sel_bg());
         }
         lines.push(line);
     }
@@ -702,7 +708,7 @@ fn draw_conn_form(f: &mut Frame, area: Rect, form: &ConnForm) {
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Green))
+        .border_style(Style::new().fg(theme::accent()))
         .title(title);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -711,9 +717,11 @@ fn draw_conn_form(f: &mut Frame, area: Rect, form: &ConnForm) {
     for (i, field) in form.fields.iter().enumerate() {
         let focused = i == form.focus;
         let label_style = if focused {
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::new()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(Color::Cyan)
+            Style::new().fg(theme::key())
         };
         let mut spans = vec![Span::styled(
             format!(" {:<10}", CONN_FIELD_LABELS[i]),
@@ -728,32 +736,34 @@ fn draw_conn_form(f: &mut Frame, area: Rect, form: &ConnForm) {
         Span::styled(
             " read_only ",
             if ro_focused {
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::new()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::new().fg(Color::Cyan)
+                Style::new().fg(theme::key())
             },
         ),
         Span::styled(
             if form.read_only { "[x]" } else { "[ ]" },
             if ro_focused {
                 Style::new()
-                    .fg(Color::White)
+                    .fg(theme::text())
                     .add_modifier(Modifier::REVERSED)
             } else {
-                Style::new().fg(Color::White)
+                Style::new().fg(theme::text())
             },
         ),
-        Span::styled("  (space toggles)", Style::new().fg(Color::DarkGray)),
+        Span::styled("  (space toggles)", Style::new().fg(theme::dim())),
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         " tip: leave uri empty and set uri_env to keep secrets out of the file",
-        Style::new().fg(Color::DarkGray),
+        Style::new().fg(theme::dim()),
     )));
     if let Some(e) = &form.error {
         lines.push(Line::from(Span::styled(
             format!(" ✗ {e}"),
-            Style::new().fg(Color::Red),
+            Style::new().fg(theme::error()),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -796,11 +806,11 @@ fn draw_agg_screen(f: &mut Frame, app: &mut App) {
     for (k, d) in entries {
         spans.push(Span::styled(
             format!(" {k} "),
-            Style::new().fg(Color::Black).bg(Color::DarkGray),
+            Style::new().fg(theme::badge_fg()).bg(theme::border_dim()),
         ));
         spans.push(Span::styled(
             format!(" {d}  "),
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), help);
@@ -837,15 +847,15 @@ fn draw_agg_stages(f: &mut Frame, agg: &AggState, area: Rect) {
         let mut line = Line::from(vec![
             Span::styled(
                 format!(" {marker}"),
-                Style::new().fg(if ran { Color::Green } else { Color::DarkGray }),
+                Style::new().fg(if ran { theme::ok() } else { theme::dim() }),
             ),
-            Span::styled(format!("{} {name}", i + 1), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("{} {name}", i + 1), Style::new().fg(theme::key())),
         ]);
         if i == agg.selected_stage {
             line.style = Style::new().bg(if focused {
-                Color::Blue
+                theme::sel_bg()
             } else {
-                Color::DarkGray
+                theme::sel_bg_dim()
             });
         }
         lines.push(line);
@@ -853,7 +863,7 @@ fn draw_agg_stages(f: &mut Frame, agg: &AggState, area: Rect) {
     if agg.stages.is_empty() {
         lines.push(Line::from(Span::styled(
             " (invalid pipeline)",
-            Style::new().fg(Color::Red),
+            Style::new().fg(theme::error()),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -864,7 +874,7 @@ fn draw_agg_editor(f: &mut Frame, agg: &mut AggState, area: Rect) {
     let title = match &agg.error {
         Some(e) => Line::from(vec![
             Span::raw(" Pipeline ─ "),
-            Span::styled(e.clone(), Style::new().fg(Color::Red)),
+            Span::styled(e.clone(), Style::new().fg(theme::error())),
             Span::raw(" "),
         ]),
         None => Line::raw(" Pipeline (json5, ^r runs) "),
@@ -917,14 +927,14 @@ fn draw_agg_results(f: &mut Frame, agg: &mut AggState, area: Rect, spin: &str) {
     for (i, rline) in agg.lines.iter().enumerate().skip(agg.scroll).take(height) {
         let mut line = rline.line.clone();
         if focused && i == agg.cursor {
-            line.style = Style::new().bg(Color::Blue);
+            line.style = Style::new().bg(theme::sel_bg());
         }
         lines.push(line);
     }
     if len == 0 && !agg.running && agg.ran_through.is_some() {
         lines.push(Line::from(Span::styled(
             "  no documents produced",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -936,10 +946,10 @@ fn draw_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Red))
+        .border_style(Style::new().fg(theme::error()))
         .title(Line::from(Span::styled(
             format!(" {} ", confirm.title),
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme::error()).add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -947,11 +957,16 @@ fn draw_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
     let mut lines: Vec<Line> = confirm
         .body
         .iter()
-        .map(|s| Line::from(Span::styled(format!(" {s}"), Style::new().fg(Color::White))))
+        .map(|s| {
+            Line::from(Span::styled(
+                format!(" {s}"),
+                Style::new().fg(theme::text()),
+            ))
+        })
         .collect();
     lines.push(Line::raw(""));
     if confirm.typed_required.is_some() {
-        let mut spans = vec![Span::styled(" > ", Style::new().fg(Color::Yellow))];
+        let mut spans = vec![Span::styled(" > ", Style::new().fg(theme::warn()))];
         spans.extend(confirm.typed.spans(true));
         lines.push(Line::from(spans));
         let ok = confirm.typed_ok();
@@ -961,12 +976,12 @@ fn draw_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
             } else {
                 " esc cancel"
             },
-            Style::new().fg(if ok { Color::Green } else { Color::DarkGray }),
+            Style::new().fg(if ok { theme::ok() } else { theme::dim() }),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             " y/↵ confirm · n/esc cancel",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -978,7 +993,7 @@ fn draw_json_editor(f: &mut Frame, area: Rect, editor: &mut JsonEditor) {
     let title = format!(" {} ─ ^s save · esc cancel ", editor.title);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_style(Style::new().fg(theme::accent()))
         .title(title);
     let mut inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -988,7 +1003,7 @@ fn draw_json_editor(f: &mut Frame, area: Rect, editor: &mut JsonEditor) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" ✗ {e}"),
-                Style::new().fg(Color::White).bg(Color::Red),
+                Style::new().fg(theme::badge_fg()).bg(theme::error()),
             ))),
             err_area,
         );
@@ -1003,7 +1018,7 @@ fn draw_indexes(f: &mut Frame, area: Rect, view: &IndexesView, spin: &str) {
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_style(Style::new().fg(theme::accent()))
         .title(format!(
             " Indexes ─ {}.{} ─ c create · d drop · r refresh · esc close ",
             view.db, view.coll
@@ -1015,11 +1030,11 @@ fn draw_indexes(f: &mut Frame, area: Rect, view: &IndexesView, spin: &str) {
     match &view.indexes {
         None => lines.push(Line::from(Span::styled(
             format!(" {spin} loading…"),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::warn()),
         ))),
         Some(list) if list.is_empty() => lines.push(Line::from(Span::styled(
             " no indexes",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         ))),
         Some(list) => {
             for (i, idx) in list.iter().enumerate() {
@@ -1028,12 +1043,12 @@ fn draw_indexes(f: &mut Frame, area: Rect, view: &IndexesView, spin: &str) {
                     .into_relaxed_extjson()
                     .to_string();
                 let mut line = Line::from(vec![
-                    Span::styled(format!(" {:<24}", idx.name), Style::new().fg(Color::Cyan)),
-                    Span::styled(keys_json, Style::new().fg(Color::White)),
-                    Span::styled(unique, Style::new().fg(Color::Yellow)),
+                    Span::styled(format!(" {:<24}", idx.name), Style::new().fg(theme::key())),
+                    Span::styled(keys_json, Style::new().fg(theme::text())),
+                    Span::styled(unique, Style::new().fg(theme::warn())),
                 ]);
                 if i == view.selected {
-                    line.style = Style::new().bg(Color::Blue);
+                    line.style = Style::new().bg(theme::sel_bg());
                 }
                 lines.push(line);
             }
@@ -1047,7 +1062,7 @@ fn draw_ops_log(f: &mut Frame, area: Rect, log: &[String], scroll: &mut usize) {
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_style(Style::new().fg(theme::accent()))
         .title(format!(
             " Operations log ({} · session, UTC) ─ esc close ",
             log.len()
@@ -1060,13 +1075,13 @@ fn draw_ops_log(f: &mut Frame, area: Rect, log: &[String], scroll: &mut usize) {
     if log.is_empty() {
         lines.push(Line::from(Span::styled(
             " no write operations this session",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )));
     }
     for entry in log.iter().skip(*scroll).take(inner.height as usize) {
         lines.push(Line::from(Span::styled(
             format!(" {entry}"),
-            Style::new().fg(Color::White),
+            Style::new().fg(theme::text()),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -1077,11 +1092,11 @@ fn draw_prompt(f: &mut Frame, area: Rect, prompt: &Prompt) {
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_style(Style::new().fg(theme::accent()))
         .title(format!(" {} ─ ↵ ok · esc cancel ", prompt.title));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    let mut spans = vec![Span::styled(" > ", Style::new().fg(Color::Yellow))];
+    let mut spans = vec![Span::styled(" > ", Style::new().fg(theme::warn()))];
     spans.extend(prompt.input.spans(true));
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
@@ -1091,7 +1106,7 @@ fn draw_query_editor(f: &mut Frame, area: Rect, editor: &QueryEditor) {
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_style(Style::new().fg(theme::accent()))
         .title(" Query editor ─ ↵ run · esc cancel ");
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -1100,9 +1115,11 @@ fn draw_query_editor(f: &mut Frame, area: Rect, editor: &QueryEditor) {
     for (i, field) in editor.fields.iter().enumerate() {
         let focused = i == editor.focus;
         let label_style = if focused {
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::new()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(Color::Cyan)
+            Style::new().fg(theme::key())
         };
         let mut spans = vec![Span::styled(
             format!(" {:<11}", QUERY_FIELD_LABELS[i]),
@@ -1115,7 +1132,7 @@ fn draw_query_editor(f: &mut Frame, area: Rect, editor: &QueryEditor) {
     if let Some(e) = &editor.error {
         lines.push(Line::from(Span::styled(
             format!(" {e}"),
-            Style::new().fg(Color::Red),
+            Style::new().fg(theme::error()),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -1130,7 +1147,7 @@ fn draw_doc_view(f: &mut Frame, area: Rect, view: &mut DocView) {
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_style(Style::new().fg(theme::accent()))
         .title(format!(" {} ", view.title));
     let mut inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -1140,7 +1157,7 @@ fn draw_doc_view(f: &mut Frame, area: Rect, view: &mut DocView) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" ⚠ {warn}"),
-                Style::new().fg(Color::White).bg(Color::Red),
+                Style::new().fg(theme::badge_fg()).bg(theme::error()),
             ))),
             warn_area,
         );
@@ -1161,7 +1178,7 @@ fn draw_doc_view(f: &mut Frame, area: Rect, view: &mut DocView) {
     for (i, rline) in view.lines.iter().enumerate().skip(view.scroll).take(height) {
         let mut line = rline.line.clone();
         if i == view.cursor {
-            line.style = Style::new().bg(Color::Blue);
+            line.style = Style::new().bg(theme::sel_bg());
         }
         lines.push(line);
     }
@@ -1172,12 +1189,14 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     let popup = centered(area, 66, 30);
     f.render_widget(Clear, popup);
 
-    let key = |k: &str| Span::styled(format!("  {k:<14}"), Style::new().fg(Color::Cyan));
-    let txt = |t: &str| Span::styled(t.to_string(), Style::new().fg(Color::White));
+    let key = |k: &str| Span::styled(format!("  {k:<14}"), Style::new().fg(theme::key()));
+    let txt = |t: &str| Span::styled(t.to_string(), Style::new().fg(theme::text()));
     let head = |t: &str| {
         Line::from(Span::styled(
             format!(" {t}"),
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
         ))
     };
     let lines = vec![
@@ -1207,6 +1226,8 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
             key("a"),
             txt("aggregation editor (stage-by-stage preview)"),
         ]),
+        Line::from(vec![key("m"), txt("open mongosh on this connection")]),
+        Line::from(vec![key("esc"), txt("cancel a running query")]),
         Line::raw(""),
         head("Writes (blocked in read-only mode)"),
         Line::from(vec![key("e / i"), txt("edit document · insert document")]),
@@ -1237,7 +1258,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     ];
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_style(Style::new().fg(theme::accent()))
         .title(" Keybindings (any key closes) ");
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
 }

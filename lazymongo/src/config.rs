@@ -39,6 +39,9 @@ impl SavedConnection {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
+    /// Theme name (see theme::NAMES); None = default dark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
     #[serde(default)]
     pub connections: Vec<SavedConnection>,
 }
@@ -61,15 +64,12 @@ pub fn load_config() -> Result<Config, String> {
     }
 }
 
-/// Write the connections list back to config.toml (in-app connection
-/// management). Note: rewriting drops any hand-written comments.
-pub fn save_connections(connections: &[SavedConnection]) -> Result<(), String> {
+/// Write the config back to config.toml (in-app connection manager and
+/// theme switching). Note: rewriting drops any hand-written comments.
+pub fn save_config(config: &Config) -> Result<(), String> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let config = Config {
-        connections: connections.to_vec(),
-    };
-    let body = toml::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    let body = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
     let body = format!(
         "# lazymongo connections — managed in-app (C key) or by hand.\n# Prefer uri_env over uri for secrets: the URI is read from that env var.\n\n{body}"
     );
@@ -136,6 +136,7 @@ mod tests {
             },
         ];
         let body = toml::to_string_pretty(&Config {
+            theme: Some("claude-dark".into()),
             connections: conns.clone(),
         })
         .unwrap();
