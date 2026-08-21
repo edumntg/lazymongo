@@ -1,120 +1,177 @@
 # lazymongo
 
-*lazygit for MongoDB*: a fast, single-binary terminal UI for browsing, querying, and managing MongoDB — built in Rust with [ratatui](https://ratatui.rs) and the official MongoDB driver.
+> **lazygit for MongoDB** — a fast, keyboard-driven terminal UI for browsing, querying, and managing MongoDB. Single binary, ~3 MB, ~10 MB of RAM.
 
-**Status:** v1 feature set (M0–M4 of [PRD.md](PRD.md)) implemented.
+[![CI](https://github.com/edumntg/lazymongo/actions/workflows/ci.yml/badge.svg)](https://github.com/edumntg/lazymongo/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 
-Measured on the current build: **3.4 MB release binary**, **~10 MB RSS** while browsing a 500-doc collection (PRD budgets: ≤10 MB / ≤50 MB). Cold start is instant; all MongoDB I/O runs off the render path.
-
-## Install & run
-
-```sh
-# from source
-cargo install --path lazymongo          # installs to ~/.cargo/bin
-# or build and copy the binary anywhere on your PATH:
-cargo build --release && cp target/release/lazymongo ~/.local/bin/
-
-lazymongo "mongodb://localhost:27017"    # or mongodb+srv://…
-lazymongo --readonly "mongodb+srv://…"   # block all writes
-lazymongo                                # saved-connections picker (see below)
+```
+┌ lazymongo  prod (mongodb+srv://***@cluster0...)  •  MongoDB 7.0  •  12ms ─────────────────────┐
+│ ╭ 1 Explorer ───────────╮ ╭ 2 Results ─ app_db.users [json] ~48.2k docs (60 loaded+) ────────╮ │
+│ │ ▾ app_db        1.2GB │ │ ▸ [1] { _id: ObjectId("66c3…"), name: "Ada", status: "active" } │ │
+│ │    users        ~48.2k│ │ ▾ [2] {                                                         │ │
+│ │    orders       ~301k │ │     name: "Grace Hopper",                                       │ │
+│ │    events       ~9.1M │ │     age: 36,                                                    │ │
+│ │ ▸ analytics_db        │ │   ▸ address: {…3}                                               │ │
+│ ╰───────────────────────╯ ╰──────────────────────────────────────────────────────────────────╯ │
+│ ╭ 3 Query (find filter) ────────────────────────────────────────────────────────────────────╮  │
+│ │ filter> { status: 'active', age: { $gt: 21 } }                                            │  │
+│ ╰────────────────────────────────────────────────────────────────────────────────────────────╯ │
+│  ↵ run   v table   F query   x explain   e edit   d delete   a aggregate   ? help   q quit     │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Tagged releases (`git tag v0.1.0 && git push origin v0.1.0`) build signed-checksum
-binaries for macOS (arm64/x86_64), Linux (musl, arm64/x86_64), and Windows via
-`.github/workflows/release.yml`. A Homebrew formula template lives in
-`packaging/homebrew/lazymongo.rb` — copy it into a `homebrew-tap` repo and fill
-in the release checksums to enable `brew install <owner>/tap/lazymongo`.
+## Why
+
+| | Compass | mongosh | **lazymongo** |
+|---|---|---|---|
+| Memory | 500 MB+ (Electron) | light | **~10 MB** |
+| Startup | seconds | instant | **instant** |
+| Works over SSH / in tmux | ❌ | ✅ | ✅ |
+| Visual browsing, folding, tables | ✅ | ❌ | ✅ |
+| Mouse + keyboard | ✅ | ❌ | ✅ |
+
+lazymongo streams documents through cursor batches with a hard memory cap, so
+opening a 100M-document collection costs the same as opening a tiny one. All
+MongoDB I/O runs off the render path — the UI never blocks on the network.
+
+## Install
+
+**From a release** (macOS arm64/x86_64 · Linux musl arm64/x86_64 · Windows):
+
+```sh
+# grab the archive for your platform from the releases page, then:
+tar xzf lazymongo-*-<your-target>.tar.gz
+mv lazymongo-*/lazymongo ~/.local/bin/    # or anywhere on your PATH
+```
+
+**From source** (Rust 1.80+):
+
+```sh
+git clone https://github.com/edumntg/lazymongo && cd lazymongo
+cargo install --path lazymongo            # installs to ~/.cargo/bin
+```
+
+## Quick start
+
+```sh
+lazymongo "mongodb://localhost:27017"     # any mongodb:// or mongodb+srv:// URI
+lazymongo --readonly "mongodb+srv://…"    # hard-block all writes (great for prod)
+lazymongo --theme claude-dark             # pick a theme
+lazymongo                                 # saved-connections picker (see Connections)
+```
+
+Then: arrow keys or `j`/`k` to move, `Enter` to expand a database / open a
+collection / fold a document, and **`?` for the full keymap at any time**.
+Everything is also reachable by mouse (click, click headers to sort, scroll)
+and through the fuzzy **command palette** (`Ctrl-P` or `:`).
 
 ## Features
 
 ### Browse & query
-- Explorer sidebar: databases with sizes, collections with estimated counts, `/` filter
-- Cursor-batched browsing (50/batch), infinite scroll, sliding memory window (max 2000 docs)
-- Foldable syntax-highlighted Extended JSON view; **table view** (`v`) with inferred
-  columns, column navigation, and server-side sort (`s` or click a header)
-- Filter bar with mongosh-style relaxed syntax (`{ status: 'active', age: { $gt: 21 } }`)
-  and canonical Extended JSON (`$oid`, `$date`, …); per-collection **persisted history** (↑/↓)
-- Structured query editor (`F`): filter / projection / sort / limit / skip
-- Full-screen document view (`o`, or `Enter` on a table row)
-- `x` **explain** (executionStats) with a COLLSCAN warning banner
-- `/` **search** loaded results (live jump, `n`/`N` next/prev) — json and table views
-- `Esc` **cancels** a running query or aggregation mid-flight
-- `y` copy doc to clipboard · `E` export loaded window as JSON or CSV
-- `Ctrl-P` / `:` **command palette**: every feature fuzzy-searchable, incl. theme switching
-- `m` drops you into **mongosh** on the current connection (TUI suspends/resumes)
+- Explorer sidebar with db sizes and collection counts (streamed in the
+  background — expanding a db is instant even on huge remote clusters)
+- Instant open on any collection size: a small first batch paints immediately,
+  then pages of 50 stream in as you scroll (2,000-doc memory window)
+- **JSON view** with folding and syntax highlighting, or **table view** (`v`)
+  with inferred columns and server-side sort (`s` / click a header)
+- Filters in relaxed **mongosh syntax**: `{ status: 'active', age: { $gt: 21 } }`,
+  plus Extended JSON (`$oid`, `$date`, …); per-collection persisted history (`↑`/`↓`)
+- Structured query editor (`F`): filter / projection / sort / **limit** / **skip**
+- `x` **explain** with executionStats and a COLLSCAN warning banner
+- `/` search the loaded results (live jump, `n`/`N`) · `Esc` cancels a running query
+- `o` full-screen document view · `y` copy to clipboard · `E` export JSON/CSV
 
-### Write operations (all confirmed, all logged)
-- `e` edit document in a JSON editor — field-level diff shown before `replaceOne`
-- `i` insert document · `d` delete document (confirm with preview)
-- `D` delete-by-filter and `U` update-many: **dry-run count first**; delete-many
-  requires typing the count
-- `I` index view: create (JSON key spec) and drop indexes
-- `N` create collection · `X` drop collection (type its name to confirm)
-- `L` session operations log; every write auto-refreshes the open view
-- `--readonly` (or per-connection `read_only`) blocks writes in the UI **and** at the I/O layer
+### Write operations — always confirmed, always logged
+- `e` edit (JSON editor with a field-level diff before `replaceOne`) · `i` insert
+- `d` delete one (with preview) · `D` **bulk delete** by filter · `U` **bulk update**
+  by filter — both run a `countDocuments` **dry run first**; delete-many requires
+  typing the count
+- `I` indexes: list, create, drop · `N`/`X` create / drop collection (type its name)
+- `L` session operations log · `--readonly` blocks writes in the UI **and** at the I/O layer
 
 ### Aggregations (`a`)
-- Full-screen JSON5 pipeline editor with **stage-by-stage preview**: select any stage
-  and run the pipeline truncated to it (`Enter`), or `Ctrl-R` for the full pipeline
-- Pipelines are persisted per collection across sessions
-- `$out`/`$merge` write stages are refused in the preview (a preview must never write)
+- Full-screen JSON5 pipeline editor with **stage-by-stage preview**: select any
+  stage and run the pipeline truncated to it (`Enter`), or `Ctrl-R` for all of it
+- Pipelines persist per collection across sessions
+- `$out`/`$merge` are refused in the preview — a preview must never write
 
-### Themes
-Six built-in palettes: `dark` (default), `light`, `claude-dark`, `claude-light`,
-`termius`, `high-contrast`. Switch via the command palette (persists), the
-`--theme` flag, or `theme = "claude-dark"` in config.toml. The ANSI themes
-inherit your terminal's scheme; the branded ones use truecolor.
+### Quality of life
+- **Command palette** (`Ctrl-P` / `:`): every action fuzzy-searchable by name
+- **`m` drops you into mongosh** on the current connection; exit to return
+- **6 themes**: `dark` · `light` · `claude-dark` · `claude-light` · `termius` ·
+  `high-contrast` — switch live from the palette (persists), `--theme`, or config
+- Credentials always redacted on screen; live server version + ping in the status bar
+- Panic-safe terminal restore; stale results dropped via generation tokens
 
-### Connections
-- **In-app manager**: press `C` anywhere (or launch with no URI) — add (`a`),
-  edit (`e`), delete (`d`), connect (`Enter`). Changes are written to config.toml.
-- Or edit `~/.config/lazymongo/config.toml` by hand:
+## Connections
+
+Press `C` anywhere (or launch with no URI) for the connection manager —
+add / edit / delete / connect without touching a file. It persists to
+`~/.config/lazymongo/config.toml`, which you can also edit by hand:
 
 ```toml
+theme = "claude-dark"
+
 [[connections]]
 name = "local"
 uri = "mongodb://localhost:27017"
 
 [[connections]]
 name = "prod"
-uri_env = "MONGO_PROD_URI"   # secret stays in the environment
-read_only = true             # RO badge + writes blocked
+uri_env = "MONGO_PROD_URI"   # secret stays in your environment, not this file
+read_only = true             # RO badge + all writes blocked
 ```
 
-- Run `lazymongo` with no URI to get the connection picker
-- Credentials are always redacted in the UI; server version + live ping in the status bar
+## Key bindings (essentials — `?` shows everything)
 
-Keyboard (arrows *and* vim keys) and mouse (click to focus/select/open/sort,
-wheel scroll) everywhere; `?` shows the full keymap; panic-safe terminal restore.
+| Key | Action |
+|---|---|
+| `Tab` / `1` `2` `3` | Switch pane (explorer / results / query) |
+| `↑↓` `jk` / mouse wheel | Move |
+| `Enter` | Expand db · open collection · fold/unfold |
+| `3` + type + `Enter` | Run a filter |
+| `F` | Query editor (projection / sort / limit / skip) |
+| `v` · `o` · `x` | Table view · doc view · explain |
+| `e` `i` `d` `D` `U` | Edit · insert · delete · bulk delete · bulk update |
+| `a` · `I` · `L` · `m` | Aggregations · indexes · ops log · mongosh |
+| `Ctrl-P` / `:` | Command palette |
+| `C` · `r` · `?` · `q` | Connections · refresh · help · quit |
+
+## How it works
+
+Two crates: `lazymongo-core` owns a single async **I/O actor** (the official
+MongoDB Rust driver on tokio) that the UI talks to over channels — commands in,
+events out, with generation tokens so stale results can never render. The
+`lazymongo` binary is a [ratatui](https://ratatui.rs) frontend with an
+Elm-style update loop. No network call ever runs on the render path, every
+query is cancellable, and documents live in a bounded sliding window so memory
+stays flat regardless of collection size.
 
 ## Development
 
 ```sh
-# unit tests
-cargo test --workspace
+cargo test --workspace                       # unit tests
 
-# integration tests self-seed any MongoDB (CI uses a mongo:7 service container):
+# integration tests self-seed any empty MongoDB:
 docker run -d --name lazymongo-test -p 27099:27017 mongo:7
 LAZYMONGO_TEST_URI=mongodb://localhost:27099 cargo test -p lazymongo-core
 
-# PTY smoke tests (drive the real binary via expect):
-cargo build && expect scripts/smoke.exp        # M0/M1: browse, fold, query
-expect scripts/smoke-m2.exp                    # table view, query editor, explain
-expect scripts/smoke-m3.exp                    # full write lifecycle
-expect scripts/smoke-m4.exp <scratch-xdg-dir>  # picker, aggregation, persistence
-expect scripts/smoke-connmgr.exp <scratch-dir> # in-app connection manager
+# PTY end-to-end tests (drive the real binary via expect):
+cargo build && expect scripts/smoke.exp mongodb://localhost:27099
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy `-D warnings`, and the full
-test suite against a MongoDB service container on every push/PR, plus build +
-unit tests on macOS and Windows.
+CI runs fmt, clippy `-D warnings`, and the full suite against a MongoDB
+service container on every push; tagged `v*` releases build binaries for all
+platforms with checksums.
 
-Crate layout per the PRD: `lazymongo-core` (types, relaxed query parsing, and the
-Mongo I/O actor — no TUI deps) and `lazymongo` (ratatui frontend, Elm-style
-update loop).
+## Roadmap
 
-### Not yet implemented (post-v1)
-`$EDITOR` integration for document editing, non-interactive `--eval` mode,
-server-side `killOp` on cancel (client-side cancellation works; the server op
-is still bounded by maxTimeMS), OS-keychain secrets, schema sampling view,
-raw-BSON document storage. See PRD.md for the roadmap.
+`$EDITOR` integration for document editing · non-interactive `--eval` mode for
+scripting · server-side `killOp` on cancel · OS-keychain secrets · schema
+sampling view. Issues and PRs welcome.
+
+## License
+
+[MIT](LICENSE)
