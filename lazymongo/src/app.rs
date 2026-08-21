@@ -2230,10 +2230,10 @@ impl App {
                         }
                     }
                     MouseEventKind::ScrollDown if agg.results_area.contains(pos) => {
-                        agg.scroll = (agg.scroll + 3).min(agg.lines.len().saturating_sub(1));
+                        agg.cursor = (agg.cursor + 3).min(agg.lines.len().saturating_sub(1));
                     }
                     MouseEventKind::ScrollUp if agg.results_area.contains(pos) => {
-                        agg.scroll = agg.scroll.saturating_sub(3);
+                        agg.cursor = agg.cursor.saturating_sub(3);
                     }
                     _ => {}
                 }
@@ -2244,10 +2244,10 @@ impl App {
             match (&mut self.modal, m.kind) {
                 (Modal::Help, MouseEventKind::Down(_)) => self.modal = Modal::None,
                 (Modal::DocView(view), MouseEventKind::ScrollDown) => {
-                    view.scroll = (view.scroll + 3).min(view.lines.len().saturating_sub(1));
+                    view.cursor = (view.cursor + 3).min(view.lines.len().saturating_sub(1));
                 }
                 (Modal::DocView(view), MouseEventKind::ScrollUp) => {
-                    view.scroll = view.scroll.saturating_sub(3);
+                    view.cursor = view.cursor.saturating_sub(3);
                 }
                 _ => {}
             }
@@ -2317,30 +2317,23 @@ impl App {
         }
     }
 
+    /// Wheel scrolling moves the *selection* (lazygit-style). Moving the raw
+    /// scroll offset instead would fight the keep-selection-visible logic,
+    /// which snaps the view back every frame — the list could never be
+    /// scrolled past the selected item's page.
     fn scroll_under_mouse(&mut self, pos: Position, delta: isize) {
         if self.explorer_area.contains(pos) {
             let n = self.explorer.rows().len();
-            let s = self.explorer.scroll as isize + delta;
-            self.explorer.scroll = s.clamp(0, n.saturating_sub(1) as isize) as usize;
+            let s = self.explorer.selected as isize + delta;
+            self.explorer.selected = s.clamp(0, n.saturating_sub(1) as isize) as usize;
         } else if self.results_area.contains(pos) {
             match self.view {
-                ViewMode::Json => {
-                    let n = self.results.lines.len();
-                    let s = self.results.scroll as isize + delta;
-                    self.results.scroll = s.clamp(0, n.saturating_sub(1) as isize) as usize;
-                    if self.results.scroll + (self.results_area.height as usize) + 10 >= n {
-                        self.maybe_fetch_more();
-                    }
-                }
+                ViewMode::Json => self.move_results_cursor(delta),
                 ViewMode::Table => {
                     let n = self.results.docs.len();
-                    let s = self.results.table.scroll_row as isize + delta;
-                    self.results.table.scroll_row =
-                        s.clamp(0, n.saturating_sub(1) as isize) as usize;
-                    if self.results.table.scroll_row + (self.results_area.height as usize) + 10 >= n
-                    {
-                        self.maybe_fetch_more();
-                    }
+                    let s = self.results.table.row as isize + delta;
+                    self.results.table.row = s.clamp(0, n.saturating_sub(1) as isize) as usize;
+                    self.maybe_fetch_more();
                 }
             }
         }
