@@ -7,7 +7,11 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn new_find_with_live_cursor() {
-    let uri = std::env::var("LAZYMONGO_TEST_URI").unwrap();
+    // Skip (like the rest of the integration suite) when no test server
+    // is configured — e.g. the macOS/Windows CI builders.
+    let Ok(uri) = std::env::var("LAZYMONGO_TEST_URI") else {
+        return;
+    };
     let (cmd, mut evt, _cancel) = actor::spawn(false);
     cmd.send(Command::Connect { uri }).await.unwrap();
     loop {
