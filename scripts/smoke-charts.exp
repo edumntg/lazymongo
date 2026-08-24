@@ -1,0 +1,96 @@
+#!/usr/bin/expect -f
+# Chart view for aggregation results (g) + sampled schema view (S).
+set timeout 15
+proc drain {secs} {
+    set save $::timeout
+    set ::timeout $secs
+    expect -re {ZZZ_NEVER_MATCHES_ZZZ}
+    set ::timeout $save
+}
+proc gate {pattern {action {}} {total 15}} {
+    set deadline [expr {[clock seconds] + $total}]
+    while {[clock seconds] < $deadline} {
+        send "\x0c"
+        set ::timeout 1
+        expect {
+            -ex $pattern { set ::timeout 15; uplevel $action; return }
+            timeout {}
+            eof { send_user "\nFAIL: unexpected EOF waiting for '$pattern'\n"; exit 1 }
+        }
+    }
+    send_user "\nFAIL: gate '$pattern' not reached in ${total}s\n"
+    exit 1
+}
+set S [lindex $argv 0]
+set env(XDG_CONFIG_HOME) "$S/xdg-charts"
+spawn ./target/debug/lazymongo mongodb://localhost:27099
+stty rows 40 columns 140 < $spawn_out(slave,name)
+gate "app_db"
+drain 1
+send "/users"
+gate "users"
+send "\r\r"
+gate "Results ─ app_db.users"
+drain 1
+# Schema view: sampled field presence + types
+send "S"
+gate "Schema ─ app_db.users (sample of 100)" { send_user "\n=== SCHEMA SAMPLED OK ===\n" }
+gate "presence"
+gate "objectId"
+send "\x1b"
+drain 0.2
+# Aggregation: group by status, run, toggle chart
+send "a"
+gate "Pipeline"
+send "\x1b\[B"
+send "\x1b\[F"
+send ", { \$group: { _id: '\$status', n: { \$sum: 1 } } }"
+send "\x12"
+gate "through stage 2 (2 docs)"
+send "\x1b"
+drain 0.2
+send "\tg"
+gate "Preview \[chart:" { send_user "\n=== CHART TOGGLED OK ===\n" }
+gate "g json"
+drain 1
+send "g"
+gate "g chart" { send_user "\n=== CHART TOGGLE BACK OK ===\n" }
+# t cycles the kind; categorical ids can't line-chart and say so
+send "g"
+send "t"
+gate "\[chart:bars\]"
+send "t"
+gate "\[chart:line\]"
+gate "Line/scatter need date or numeric _id" { send_user "\n=== KIND CYCLE + HINT OK ===\n" }
+send "\x1b"
+drain 0.2
+send "\x1b"
+drain 0.2
+# numeric _id ($group by age) -> real line chart, then scatter
+send "\x14"
+gate "Open collection"
+send "orders"
+drain 0.5
+send "\r"
+gate "Results ─ app_db.orders"
+send "a"
+gate "Pipeline"
+send "\x1b\[B"
+send "\x1b\[F"
+send ", { \$group: { _id: '\$paid', n: { \$sum: 1 } } }, { \$group: { _id: { \$cond: \['\$_id', 1, 0\] }, n: { \$first: '\$n' } } }"
+send "\x12"
+gate "through stage 3 (2 docs)"
+send "\x1b"
+drain 0.2
+send "\tg"
+gate "\[chart:line\]" { send_user "\n=== NUMERIC LINE CHART OK ===\n" }
+# kind cycle from auto: bars -> line -> scatter
+send "ttt"
+gate "\[chart:scatter\]" { send_user "\n=== SCATTER OK ===\n" }
+send "\x1b"
+drain 0.2
+send "\x1b"
+drain 0.2
+send "q"
+expect eof
+send_user "\n=== CHARTS CLEAN EXIT ===\n"

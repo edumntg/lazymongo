@@ -1,7 +1,7 @@
 #!/usr/bin/expect -f
+# Shift+Enter (kitty protocol CSI 13;2u) runs the aggregation pipeline and
+# submits the JSON editor, Colab-style.
 set timeout 15
-# sleep starves the pty (the app blocks writing to a full buffer on a
-# single-threaded runtime); drain reads while waiting instead.
 proc drain {secs} {
     set save $::timeout
     set ::timeout $secs
@@ -28,42 +28,32 @@ proc gate {pattern {action {}} {total 15}} {
 set uri [lindex $argv 0]
 if {$uri eq ""} { set uri "mongodb://localhost:27099" }
 spawn ./target/debug/lazymongo $uri
-stty rows 35 columns 140 < $spawn_out(slave,name)
+stty rows 40 columns 140 < $spawn_out(slave,name)
 gate "app_db"
 drain 1
-send "jj\r"
-gate "users"
-drain 1
-send "jj\r"
-gate "User 0" { send_user "\n=== JSON VIEW OK ===\n" }
-drain 1
-# Table view: header should show columns and [table] in the title
-send "v"
-gate "\[table\]" { send_user "\n=== TABLE VIEW OK ===\n" }
-drain 1
-# Sort by active column (_id -> toggles server sort, re-runs query)
-send "lls"
-gate "email↑" { send_user "\n=== SORT OK ===\n" }
-drain 1
-# Open a row as full-screen document
+send "/app_db\r"
+drain 0.5
 send "\r"
-gate "doc 1" { send_user "\n=== DOC VIEW OK ===\n" }
+gate "users"
+send "jj\r"
+gate "loaded"
+drain 1
+# Aggregation editor: default pipeline, run with Shift+Enter
+send "a"
+gate "Pipeline"
+send "\x1b\[13;2u"
+gate "through stage 1" { send_user "\n=== AGG SHIFT-ENTER OK ===\n" }
+send "\x1b"
+drain 0.2
 send "\x1b"
 drain 0.2
 drain 1
-# Structured query editor: set a limit
-send "F"
-gate "projection" { send_user "\n=== QUERY EDITOR OK ===\n" }
-# focus filter field; tab x3 to limit; type 7; run
-send "\t\t\t7\r"
-gate "(7 loaded, all)" { send_user "\n=== LIMIT APPLIED OK ===\n" }
-drain 1
-# Explain popup
-send "x"
-gate "executionStats" { send_user "\n=== EXPLAIN OK ===\n" }
-send "\x1b"
-drain 0.2
+# JSON editor (duplicate doc) submitted with Shift+Enter
+send "c"
+gate "Duplicate document"
+send "\x1b\[13;2u"
+gate "inserted _id=" { send_user "\n=== EDITOR SHIFT-ENTER OK ===\n" }
 drain 1
 send "q"
 expect eof
-send_user "\n=== CLEAN EXIT ===\n"
+send_user "\n=== SHIFT-ENTER CLEAN EXIT ===\n"

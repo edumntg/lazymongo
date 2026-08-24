@@ -1,116 +1,144 @@
 #!/usr/bin/expect -f
 set timeout 15
+# sleep starves the pty (the app blocks writing to a full buffer on a
+# single-threaded runtime); drain reads while waiting instead.
+proc drain {secs} {
+    set save $::timeout
+    set ::timeout $secs
+    expect -re {ZZZ_NEVER_MATCHES_ZZZ}
+    set ::timeout $save
+}
+# Robust gate: poll with a full repaint (Ctrl-L) before each 1s match
+# attempt, so changed titles are re-emitted contiguously AFTER the state
+# change lands (a single early repaint can render before an async event).
+proc gate {pattern {action {}} {total 15}} {
+    set deadline [expr {[clock seconds] + $total}]
+    while {[clock seconds] < $deadline} {
+        send "\x0c"
+        set ::timeout 1
+        expect {
+            -ex $pattern { set ::timeout 15; uplevel $action; return }
+            timeout {}
+            eof { send_user "\nFAIL: unexpected EOF waiting for '$pattern'\n"; exit 1 }
+        }
+    }
+    send_user "\nFAIL: gate '$pattern' not reached in ${total}s\n"
+    exit 1
+}
 set uri [lindex $argv 0]
 if {$uri eq ""} { set uri "mongodb://localhost:27099" }
 spawn ./target/debug/lazymongo $uri
 stty rows 40 columns 140 < $spawn_out(slave,name)
-expect { "app_db" {} timeout { send_user "\nFAIL connect\n"; exit 1 } }
-sleep 1
+gate "app_db"
+drain 1
 # Filter sidebar to smoke_db, expand, open items
 send "/smoke\r"
-sleep 1
+drain 1
 send "\r"
-expect { "items" {} timeout { send_user "\nFAIL smoke_db expand\n"; exit 1 } }
-sleep 1
+gate "items"
+drain 1
 send "j\r"
-expect { "(10 loaded, all)" {} timeout { send_user "\nFAIL open items\n"; exit 1 } }
+gate "(10 loaded, all)"
 send_user "\n=== OPENED items (10 docs) ===\n"
-sleep 1
+drain 1
 # INSERT: i -> editor -> move to line 2 and type a field -> ^s
 send "i"
-expect { "Insert document" {} timeout { send_user "\nFAIL insert editor\n"; exit 1 } }
+gate "Insert document"
 send "\x1b\[B"
 send "\"a\": 1"
 send "\x13"
-expect { "inserted _id=" {} timeout { send_user "\nFAIL insert\n"; exit 1 } }
-expect { "(11 loaded, all)" {} timeout { send_user "\nFAIL insert refresh\n"; exit 1 } }
+gate "inserted _id="
+gate "(11 loaded, all)"
 send_user "\n=== INSERT OK (11 docs) ===\n"
-sleep 1
+drain 1
 # DELETE ONE: d on first doc -> confirm y
 send "gd"
-expect { "Delete document" {} timeout { send_user "\nFAIL delete confirm\n"; exit 1 } }
+gate "Delete document"
 send "y"
-expect { "(10 loaded, all)" {} timeout { send_user "\nFAIL delete refresh\n"; exit 1 } }
+gate "(10 loaded, all)"
 send_user "\n=== DELETE ONE OK (10 docs) ===\n"
-sleep 1
+drain 1
 # DELETE MANY: filter n >= 5 (5 docs), D, type count 5, enter
 send "3"
 send "{ n: { \$gte: 5 } }\r"
-expect { "(5 loaded, all)" {} timeout { send_user "\nFAIL filter\n"; exit 1 } }
+gate "(5 loaded, all)"
 send "D"
-expect { "Type the count (5)" {} timeout { send_user "\nFAIL deletemany dryrun\n"; exit 1 } }
+gate "Type the count (5)"
 send "5\r"
-expect { "deleted 5 docs" {} timeout { send_user "\nFAIL deletemany\n"; exit 1 } }
+gate "deleted 5 docs"
 send_user "\n=== DELETE MANY OK ===\n"
-sleep 1
+drain 1
 # Reset filter by reopening the collection from the explorer
 send "\x1b"
+drain 0.2
 send "1"
 send "\r"
-expect { "(5 loaded, all)" {} timeout { send_user "\nFAIL reopen\n"; exit 1 } }
-sleep 1
+gate "(5 loaded, all)"
+drain 1
 # UPDATE MANY: U -> editor prefilled with $set -> add field -> ^s -> confirm y
 send "2U"
-expect { "Update many" {} timeout { send_user "\nFAIL updatemany editor\n"; exit 1 } }
+gate "Update many"
 send "\x1b\[B\x1b\[B"
 send "\"x\": 9"
 send "\x13"
-expect { "will be modified" {} timeout { send_user "\nFAIL updatemany dryrun\n"; exit 1 } }
+gate "will be modified"
 send "y"
-expect { "updated 5 docs" {} timeout { send_user "\nFAIL updatemany\n"; exit 1 } }
+gate "updated 5 docs"
 send_user "\n=== UPDATE MANY OK ===\n"
-sleep 1
+drain 1
 # EDIT DOC: e -> save unchanged -> confirm shows no changes -> y -> replaced
 send "e"
-expect { "Edit document" {} timeout { send_user "\nFAIL edit editor\n"; exit 1 } }
+gate "Edit document"
 send "\x13"
-expect { "Apply edit" {} timeout { send_user "\nFAIL edit confirm\n"; exit 1 } }
+gate "Apply edit"
 send "y"
-expect { "matched 1" {} timeout { send_user "\nFAIL edit apply\n"; exit 1 } }
+gate "matched 1"
 send_user "\n=== EDIT DOC OK ===\n"
-sleep 1
+drain 1
 # INDEXES: I -> create n_1 -> drop it
 send "I"
-expect { "_id_" {} timeout { send_user "\nFAIL indexes\n"; exit 1 } }
+gate "_id_"
 send "c"
-expect { "Create index" {} timeout { send_user "\nFAIL index editor\n"; exit 1 } }
+gate "Create index"
 send "\x1b\[B"
 send "\"n\": 1"
 send "\x13"
-expect { "keys:" {} timeout { send_user "\nFAIL index confirm\n"; exit 1 } }
+gate "keys:"
 send "y"
-expect { "n_1" {} timeout { send_user "\nFAIL index created\n"; exit 1 } }
+gate "n_1"
 send_user "\n=== CREATE INDEX OK ===\n"
-sleep 1
+drain 1
 send "j"
 send "d"
-expect { "Drop index" {} timeout { send_user "\nFAIL drop index confirm\n"; exit 1 } }
+gate "Drop index"
 send "y"
-expect { "dropped index n_1" {} timeout { send_user "\nFAIL drop index\n"; exit 1 } }
+gate "dropped index n_1"
 send_user "\n=== DROP INDEX OK ===\n"
 send "\x1b"
-sleep 1
+drain 0.2
+drain 1
 # OPS LOG
 send "L"
-expect { "updated 5 docs" {} timeout { send_user "\nFAIL ops log\n"; exit 1 } }
+gate "updated 5 docs"
 send_user "\n=== OPS LOG OK ===\n"
 send "\x1b"
-sleep 1
+drain 0.2
+drain 1
 # CREATE + DROP COLLECTION from explorer
 send "1"
 send "N"
-expect { "New collection" {} timeout { send_user "\nFAIL create coll prompt\n"; exit 1 } }
+gate "New collection"
 send "tmpcoll\r"
-expect { "created collection smoke_db.tmpcoll" {} timeout { send_user "\nFAIL create coll\n"; exit 1 } }
+gate "created collection smoke_db.tmpcoll"
 send_user "\n=== CREATE COLLECTION OK ===\n"
-sleep 1
+drain 1
 send "j"
 send "X"
-expect { "Type the collection name" {} timeout { send_user "\nFAIL drop coll confirm\n"; exit 1 } }
+gate "Type the collection name"
 send "tmpcoll\r"
-expect { "dropped collection smoke_db.tmpcoll" {} timeout { send_user "\nFAIL drop coll\n"; exit 1 } }
+gate "dropped collection smoke_db.tmpcoll"
 send_user "\n=== DROP COLLECTION OK ===\n"
-sleep 1
+drain 1
 send "q"
 expect eof
 send_user "\n=== M3 CLEAN EXIT ===\n"

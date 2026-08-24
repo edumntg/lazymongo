@@ -1,0 +1,36 @@
+#!/usr/bin/expect -f
+set timeout 15
+proc drain {secs} {
+    set save $::timeout
+    set ::timeout $secs
+    expect -re {ZZZ_NEVER_MATCHES_ZZZ}
+    set ::timeout $save
+}
+proc gate {pattern {action {}} {total 15}} {
+    set deadline [expr {[clock seconds] + $total}]
+    while {[clock seconds] < $deadline} {
+        send "\x0c"
+        set ::timeout 1
+        expect {
+            -ex $pattern { set ::timeout 15; uplevel $action; return }
+            timeout {}
+            eof { send_user "\nFAIL: unexpected EOF waiting for '$pattern'\n"; exit 1 }
+        }
+    }
+    send_user "\nFAIL: gate '$pattern' not reached in ${total}s\n"
+    exit 1
+}
+spawn ./target/debug/lazymongo mongodb://localhost:27099
+stty rows 40 columns 140 < $spawn_out(slave,name)
+gate "app_db"
+drain 1
+# fuzzy filter: "itms" is a subsequence of "items"; the db auto-expands
+# virtually and the selection lands on the collection itself
+send "/itms"
+gate "items"
+send "\r\r"
+gate "Results ─ smoke_db.items" { send_user "\n=== FUZZY FILTER OPEN OK ===\n" }
+drain 1
+send "q"
+expect eof
+send_user "\n=== FILTER CLEAN EXIT ===\n"

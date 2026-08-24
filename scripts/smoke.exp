@@ -1,5 +1,30 @@
 #!/usr/bin/expect -f
 set timeout 15
+# sleep starves the pty (the app blocks writing to a full buffer on a
+# single-threaded runtime); drain reads while waiting instead.
+proc drain {secs} {
+    set save $::timeout
+    set ::timeout $secs
+    expect -re {ZZZ_NEVER_MATCHES_ZZZ}
+    set ::timeout $save
+}
+# Robust gate: poll with a full repaint (Ctrl-L) before each 1s match
+# attempt, so changed titles are re-emitted contiguously AFTER the state
+# change lands (a single early repaint can render before an async event).
+proc gate {pattern {action {}} {total 15}} {
+    set deadline [expr {[clock seconds] + $total}]
+    while {[clock seconds] < $deadline} {
+        send "\x0c"
+        set ::timeout 1
+        expect {
+            -ex $pattern { set ::timeout 15; uplevel $action; return }
+            timeout {}
+            eof { send_user "\nFAIL: unexpected EOF waiting for '$pattern'\n"; exit 1 }
+        }
+    }
+    send_user "\nFAIL: gate '$pattern' not reached in ${total}s\n"
+    exit 1
+}
 # Run the TUI in a PTY against the test container
 set uri [lindex $argv 0]
 if {$uri eq ""} { set uri "mongodb://localhost:27099" }
@@ -7,44 +32,29 @@ spawn ./target/debug/lazymongo $uri
 # expect PTYs default to 0x0; give the app a real screen
 stty rows 35 columns 120 < $spawn_out(slave,name)
 # Wait for connect + database list
-expect {
-    "app_db" { send_user "\n=== SAW app_db ===\n" }
-    timeout { send_user "\nTIMEOUT waiting for app_db\n"; exit 1 }
-}
-sleep 1
+gate "app_db" { send_user "\n=== SAW app_db ===\n" }
+drain 1
 # Move down to app_db (dbs sorted: admin, analytics_db, app_db, config, local) and expand
 send "jj\r"
-expect {
-    "users" { send_user "\n=== SAW users collection ===\n" }
-    timeout { send_user "\nTIMEOUT waiting for users\n"; exit 1 }
-}
-sleep 1
+gate "users" { send_user "\n=== SAW users collection ===\n" }
+drain 1
 # Move to users (orders, users under app_db) and open it
 send "jj\r"
-expect {
-    "User 0" { send_user "\n=== SAW documents ===\n" }
-    timeout { send_user "\nTIMEOUT waiting for docs\n"; exit 1 }
-}
-sleep 1
+gate "User 0" { send_user "\n=== SAW documents ===\n" }
+drain 1
 # Expand first doc
 send "\r"
-expect {
-    "tags" { send_user "\n=== SAW expanded doc ===\n" }
-    timeout { send_user "\nTIMEOUT waiting for expanded doc\n"; exit 1 }
-}
+gate "tags" { send_user "\n=== SAW expanded doc ===\n" }
 # Jump to query pane and run a filter
 send "3"
-sleep 1
+drain 1
 send "{ age: { \$gt: 60 } }\r"
-expect {
-    "User 43" { send_user "\n=== SAW filtered results ===\n" }
-    timeout { send_user "\nTIMEOUT waiting for filtered results\n"; exit 1 }
-}
+gate "User 43" { send_user "\n=== SAW filtered results ===\n" }
 # Open help overlay, close it, quit
 send "?"
-sleep 1
+drain 1
 send "q"
-sleep 1
+drain 1
 send "q"
 expect eof
 send_user "\n=== CLEAN EXIT ===\n"

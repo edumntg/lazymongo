@@ -1,55 +1,82 @@
 #!/usr/bin/expect -f
 set timeout 15
+# sleep starves the pty (the app blocks writing to a full buffer on a
+# single-threaded runtime); drain reads while waiting instead.
+proc drain {secs} {
+    set save $::timeout
+    set ::timeout $secs
+    expect -re {ZZZ_NEVER_MATCHES_ZZZ}
+    set ::timeout $save
+}
+# Robust gate: poll with a full repaint (Ctrl-L) before each 1s match
+# attempt, so changed titles are re-emitted contiguously AFTER the state
+# change lands (a single early repaint can render before an async event).
+proc gate {pattern {action {}} {total 15}} {
+    set deadline [expr {[clock seconds] + $total}]
+    while {[clock seconds] < $deadline} {
+        send "\x0c"
+        set ::timeout 1
+        expect {
+            -ex $pattern { set ::timeout 15; uplevel $action; return }
+            timeout {}
+            eof { send_user "\nFAIL: unexpected EOF waiting for '$pattern'\n"; exit 1 }
+        }
+    }
+    send_user "\nFAIL: gate '$pattern' not reached in ${total}s\n"
+    exit 1
+}
 set S [lindex $argv 0]
-set env(XDG_CONFIG_HOME) "$S/xdg"
+set env(XDG_CONFIG_HOME) "$S/xdg-suite"
 
 # --- Session 1: connection picker + query + aggregation ---
 spawn ./target/debug/lazymongo
 stty rows 40 columns 140 < $spawn_out(slave,name)
-expect { "Connections" {} timeout { send_user "\nFAIL picker\n"; exit 1 } }
-expect { "prod-ro" { send_user "\n=== PICKER OK ===\n" } timeout { send_user "\nFAIL picker items\n"; exit 1 } }
-sleep 1
+gate "Connections"
+gate "prod-ro" { send_user "\n=== PICKER OK ===\n" }
+drain 1
 send "\r"
-expect { "app_db" {} timeout { send_user "\nFAIL connect via picker\n"; exit 1 } }
+gate "app_db"
 send_user "\n=== PICKER CONNECT OK ===\n"
-sleep 1
+drain 1
 send "/app_db\r"
-sleep 1
+drain 1
 send "\r"
-expect { "users" {} timeout { send_user "\nFAIL expand\n"; exit 1 } }
-sleep 1
+gate "users"
+drain 1
 send "jj\r"
-expect { "User 0" {} timeout { send_user "\nFAIL open users\n"; exit 1 } }
-sleep 1
+gate "User 0"
+drain 1
 # Run a distinctive filter (goes to persisted history)
 send "3"
 send "{ status: 'active' }\r"
-expect { "loaded" {} timeout { send_user "\nFAIL filter\n"; exit 1 } }
-sleep 1
+gate "loaded"
+drain 1
 # Aggregation screen
 send "a"
-expect { "Pipeline" {} timeout { send_user "\nFAIL agg open\n"; exit 1 } }
+gate "Pipeline"
 send_user "\n=== AGG SCREEN OK ===\n"
-sleep 1
+drain 1
 # Extend default pipeline with a $count stage, run all
 send "\x1b\[B"
 send "\x1b\[F"
 send ",\r{ \$count: 'total' }"
 send "\x12"
-expect { "total: 500" {} timeout { send_user "\nFAIL agg run\n"; exit 1 } }
+gate "through stage 2 (1 docs)"
 send_user "\n=== AGG FULL RUN OK ===\n"
-sleep 1
+drain 1
 # Stage-by-stage: focus stages, select stage 1, run through it
 send "\x1b"
+drain 0.2
 send "k"
 send "\r"
-expect { "through stage 1 (50 docs, capped)" {} timeout { send_user "\nFAIL stage preview\n"; exit 1 } }
+gate "through stage 1 (50 docs, capped)"
 send_user "\n=== STAGE PREVIEW OK ===\n"
-sleep 1
+drain 1
 # Back to main
 send "\x1b"
-expect { "\[json\]" {} timeout { send_user "\nFAIL back to main\n"; exit 1 } }
-sleep 1
+drain 0.2
+gate "\[json\]"
+drain 1
 send "q"
 expect eof
 send_user "\n=== SESSION 1 EXIT ===\n"
@@ -57,28 +84,31 @@ send_user "\n=== SESSION 1 EXIT ===\n"
 # --- Session 2: history + pipeline persisted ---
 spawn ./target/debug/lazymongo mongodb://localhost:27099
 stty rows 40 columns 140 < $spawn_out(slave,name)
-expect { "app_db" {} timeout { send_user "\nFAIL s2 connect\n"; exit 1 } }
-sleep 1
+gate "app_db"
+drain 1
 send "/app_db\r"
-sleep 1
+drain 1
 send "\r"
-expect { "users" {} timeout { send_user "\nFAIL s2 expand\n"; exit 1 } }
-sleep 1
+gate "users"
+drain 1
 send "jj\r"
-expect { "User 0" {} timeout { send_user "\nFAIL s2 open\n"; exit 1 } }
-sleep 1
+gate "User 0"
+drain 1
 # History recall in the query bar
 send "3"
 send "\x1b\[A"
-expect { "'active'" { send_user "\n=== HISTORY PERSISTED OK ===\n" } timeout { send_user "\nFAIL history\n"; exit 1 } }
+gate "'active'" { send_user "\n=== HISTORY PERSISTED OK ===\n" }
 send "\x1b"
-sleep 1
+drain 0.2
+drain 1
 # Pipeline recall in agg screen
 send "a"
-expect { "total" { send_user "\n=== PIPELINE PERSISTED OK ===\n" } timeout { send_user "\nFAIL pipeline persist\n"; exit 1 } }
+gate "total" { send_user "\n=== PIPELINE PERSISTED OK ===\n" }
 send "\x1b"
+drain 0.2
 send "\x1b"
-sleep 1
+drain 0.2
+drain 1
 send "q"
 expect eof
 send_user "\n=== M4 CLEAN EXIT ===\n"

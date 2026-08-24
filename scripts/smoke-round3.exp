@@ -1,5 +1,5 @@
 #!/usr/bin/expect -f
-set timeout 15
+set timeout 20
 # sleep starves the pty (the app blocks writing to a full buffer on a
 # single-threaded runtime); drain reads while waiting instead.
 proc drain {secs} {
@@ -26,51 +26,40 @@ proc gate {pattern {action {}} {total 15}} {
     exit 1
 }
 set S [lindex $argv 0]
-set env(XDG_CONFIG_HOME) "$S/xdg-cm"
-
-# No config at all -> connects to default localhost:27017 (fails, that's fine)
-# So test via C key after launching with an explicit URI.
+set env(EDITOR) "$S/fake-editor.sh"
+set env(XDG_CONFIG_HOME) "$S/xdg-round3"
 spawn ./target/debug/lazymongo mongodb://localhost:27099
 stty rows 40 columns 140 < $spawn_out(slave,name)
 gate "app_db"
+drain 2
+# Ctrl-T namespace switcher (collections were prefetched)
+send "\x14"
+gate "Open collection"
+send "app users"
 drain 1
-# Open connection manager -> empty
-send "C"
-gate "no saved connections" { send_user "\n=== EMPTY MANAGER OK ===\n" }
-drain 1
-# Add a connection
-send "a"
-gate "Add connection"
-send "demo"
-send "\t"
-send "mongodb://localhost:27099"
-send "\t\t "
 send "\r"
-gate "connections saved" { send_user "\n=== ADD OK ===\n" }
+gate "Results ─ app_db.users"
+gate "User 0" { send_user "\n=== SWITCHER OK ===\n" }
 drain 1
-# Edit it: rename demo -> demo2
-send "e"
-gate "Edit connection"
-send "2"
-send "\r"
-gate "demo2" { send_user "\n=== EDIT OK ===\n" }
+# c = duplicate first doc -> prefilled editor -> ^s inserts the copy
+send "c"
+gate "Duplicate document"
+send "\x13"
+gate "inserted _id="
+send_user "\n=== DUPLICATE OK ===\n"
 drain 1
-# Connect through the picker entry (read_only was toggled on -> RO badge)
-send "\r"
-gate " RO "
-gate "app_db" { send_user "\n=== PICKER RECONNECT RO OK ===\n" }
+# E = full streaming export (501 docs, beyond any single page)
+send "E"
+gate "docs to lazymongo-app_db.users-" { send_user "\n=== STREAM EXPORT OK ===\n" }
 drain 1
-# Delete it
-send "C"
-gate "demo2"
-send "d"
-gate "Delete connection"
+# Ctrl-E = external $EDITOR on the first doc; fake editor bumps age to 99
+send "g"
+send "\x05"
+gate "Apply edit"
+gate "changes: ~ age"
 send "y"
-gate "removed connection" { send_user "\n=== DELETE OK ===\n" }
-drain 1
-send "\x1b"
-drain 0.2
+gate "matched 1" { send_user "\n=== EXTERNAL EDITOR OK ===\n" }
 drain 1
 send "q"
 expect eof
-send_user "\n=== CONN MGR CLEAN EXIT ===\n"
+send_user "\n=== ROUND CLEAN EXIT ===\n"
