@@ -1,6 +1,6 @@
 //! A minimal single-line text input, reused by modal fields and prompts.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
@@ -19,6 +19,10 @@ impl Input {
 
     /// Returns true if the key was consumed.
     pub fn on_key(&mut self, key: KeyEvent) -> bool {
+        // Ctrl-modified chars are commands (Ctrl-S, Ctrl-L, ...), not text.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
         match key.code {
             KeyCode::Backspace => {
                 if self.cursor > 0 {

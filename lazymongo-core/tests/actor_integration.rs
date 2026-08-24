@@ -592,3 +592,98 @@ async fn cancellation_and_write_stage_guard() {
         other => panic!("expected $out rejection, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn streaming_export_full_query() {
+    let Some(uri) = test_uri() else {
+        return;
+    };
+    ensure_seeded(&uri).await;
+    let (cmd, mut evt, _cancel) = actor::spawn(false);
+    cmd.send(Command::Connect { uri }).await.unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
+
+    let dir = std::env::temp_dir();
+    let json_path = dir.join("lazymongo-test-export.json");
+    let csv_path = dir.join("lazymongo-test-export.csv");
+
+    // Full-collection JSON export walks the entire cursor (500 docs, well
+    // past the on-screen window).
+    cmd.send(Command::ExportQuery {
+        db: "app_db".into(),
+        coll: "users".into(),
+        spec: spec(""),
+        format: lazymongo_core::types::ExportFormat::Json,
+        columns: vec![],
+        path: json_path.to_string_lossy().into_owned(),
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::ExportDone { count, .. } => assert_eq!(count, 500),
+        other => panic!("expected ExportDone, got {other:?}"),
+    }
+    let body = std::fs::read_to_string(&json_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed.as_array().unwrap().len(), 500);
+
+    // Filtered CSV export respects the spec and the column order.
+    cmd.send(Command::ExportQuery {
+        db: "app_db".into(),
+        coll: "users".into(),
+        spec: spec("{ status: 'active' }"),
+        format: lazymongo_core::types::ExportFormat::Csv,
+        columns: vec!["name".into(), "age".into(), "status".into()],
+        path: csv_path.to_string_lossy().into_owned(),
+    })
+    .await
+    .unwrap();
+    let csv_count = match recv(&mut evt).await {
+        CoreEvent::ExportDone { count, .. } => count,
+        other => panic!("expected ExportDone, got {other:?}"),
+    };
+    let body = std::fs::read_to_string(&csv_path).unwrap();
+    let mut lines = body.lines();
+    assert_eq!(lines.next(), Some("name,age,status"));
+    assert_eq!(body.lines().count() as u64, csv_count + 1); // header + rows
+    assert!(body.lines().nth(1).unwrap().ends_with(",active"));
+
+    let _ = std::fs::remove_file(json_path);
+    let _ = std::fs::remove_file(csv_path);
+}
+
+#[tokio::test]
+async fn schema_sampling() {
+    let Some(uri) = test_uri() else {
+        return;
+    };
+    ensure_seeded(&uri).await;
+    let (cmd, mut evt, _cancel) = actor::spawn(false);
+    cmd.send(Command::Connect { uri }).await.unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
+
+    cmd.send(Command::SampleSchema {
+        db: "app_db".into(),
+        coll: "users".into(),
+        size: 100,
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::SchemaSample {
+            sampled, fields, ..
+        } => {
+            assert_eq!(sampled, 100);
+            assert_eq!(fields[0].name, "_id");
+            let name = fields.iter().find(|f| f.name == "name").unwrap();
+            assert_eq!(name.present, 100);
+            assert_eq!(name.types, vec!["string"]);
+            let age = fields.iter().find(|f| f.name == "age").unwrap();
+            assert_eq!(age.types, vec!["int"]);
+            assert!(fields
+                .iter()
+                .any(|f| f.name == "address" && f.types == vec!["object"]));
+        }
+        other => panic!("expected SchemaSample, got {other:?}"),
+    }
+}

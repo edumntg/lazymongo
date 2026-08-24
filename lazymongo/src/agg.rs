@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use lazymongo_core::bson::Document;
+use lazymongo_core::bson::{Bson, Document};
 use lazymongo_core::query::{parse_pipeline, stage_name};
 use ratatui::layout::Rect;
 
@@ -12,6 +12,44 @@ use crate::textarea::TextArea;
 
 /// Docs fetched per preview run.
 pub const AGG_PREVIEW_LIMIT: usize = 50;
+
+/// How to draw chart-mode results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartKind {
+    /// Line for date/numeric _ids, bars for categorical ones.
+    Auto,
+    Bars,
+    Line,
+    Scatter,
+}
+
+impl ChartKind {
+    pub fn next(self) -> Self {
+        match self {
+            ChartKind::Auto => ChartKind::Bars,
+            ChartKind::Bars => ChartKind::Line,
+            ChartKind::Line => ChartKind::Scatter,
+            ChartKind::Scatter => ChartKind::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ChartKind::Auto => "auto",
+            ChartKind::Bars => "bars",
+            ChartKind::Line => "line",
+            ChartKind::Scatter => "scatter",
+        }
+    }
+}
+
+/// What the X values of a series represent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XKind {
+    /// Milliseconds since the epoch.
+    Date,
+    Number,
+}
 
 pub const DEFAULT_PIPELINE: &str = "[\n  { $match: {} }\n]";
 
@@ -39,6 +77,9 @@ pub struct AggState {
     pub lines: Vec<RLine>,
     pub cursor: usize,
     pub scroll: usize,
+    /// Render results as a bar chart when they are {_id, number}-shaped.
+    pub chart: bool,
+    pub chart_kind: ChartKind,
     // Hit-test rects, updated at render time.
     pub stages_area: Rect,
     pub editor_area: Rect,
@@ -62,6 +103,8 @@ impl AggState {
             lines: Vec::new(),
             cursor: 0,
             scroll: 0,
+            chart: false,
+            chart_kind: ChartKind::Auto,
             stages_area: Rect::default(),
             editor_area: Rect::default(),
             results_area: Rect::default(),
@@ -125,5 +168,152 @@ impl AggState {
             self.folds[doc_idx].insert(path);
         }
         self.rebuild_lines();
+    }
+}
+
+/// Numeric value of a BSON scalar, if any.
+fn numeric(v: &Bson) -> Option<f64> {
+    match v {
+        Bson::Int32(n) => Some(f64::from(*n)),
+        Bson::Int64(n) => Some(*n as f64),
+        Bson::Double(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// X coordinate of an _id for line/scatter charts: dates become epoch
+/// millis, numbers pass through.
+fn x_value(v: &Bson) -> Option<(f64, XKind)> {
+    match v {
+        Bson::DateTime(dt) => Some((dt.timestamp_millis() as f64, XKind::Date)),
+        other => numeric(other).map(|n| (n, XKind::Number)),
+    }
+}
+
+impl AggState {
+    /// Extract (label, value) pairs when every result doc looks like
+    /// `{_id, <numeric>}` — the shape $group/$count/$bucket produce.
+    /// Prefers well-known value keys, else the first numeric field.
+    pub fn chart_data(&self) -> Option<Vec<(String, u64)>> {
+        if self.docs.is_empty() {
+            return None;
+        }
+        const PREFERRED: [&str; 6] = ["n", "count", "total", "sum", "value", "avg"];
+        let first = &self.docs[0];
+        let value_key = PREFERRED
+            .iter()
+            .find(|k| first.get(**k).is_some_and(|v| numeric(v).is_some()))
+            .map(|k| k.to_string())
+            .or_else(|| {
+                first
+                    .iter()
+                    .find(|(k, v)| *k != "_id" && numeric(v).is_some())
+                    .map(|(k, _)| k.clone())
+            })?;
+        let mut data = Vec::with_capacity(self.docs.len());
+        for doc in &self.docs {
+            let value = numeric(doc.get(&value_key)?)?;
+            let label = doc
+                .get("_id")
+                .map(lazymongo_core::display::bson_to_compact)
+                .unwrap_or_default();
+            data.push((label, value.max(0.0).round() as u64));
+        }
+        Some(data)
+    }
+
+    /// (x, y) series for line/scatter charts, when every _id is a date or a
+    /// number. Points come back sorted by x.
+    pub fn xy_series(&self) -> Option<(Vec<(f64, f64)>, XKind)> {
+        if self.docs.is_empty() {
+            return None;
+        }
+        let labeled = self.chart_data()?; // reuse value-key detection for y
+        let mut kind = None;
+        let mut points = Vec::with_capacity(self.docs.len());
+        for (doc, (_, y)) in self.docs.iter().zip(labeled) {
+            let (x, k) = x_value(doc.get("_id")?)?;
+            match kind {
+                None => kind = Some(k),
+                Some(prev) if prev != k => return None, // mixed axis types
+                _ => {}
+            }
+            points.push((x, y as f64));
+        }
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Some((points, kind?))
+    }
+
+    /// The chart kind that will actually be drawn.
+    pub fn effective_chart_kind(&self) -> ChartKind {
+        match self.chart_kind {
+            ChartKind::Auto => {
+                if self.xy_series().is_some() {
+                    ChartKind::Line
+                } else {
+                    ChartKind::Bars
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lazymongo_core::bson::doc;
+
+    fn state_with(docs: Vec<Document>) -> AggState {
+        let mut s = AggState::new("d".into(), "c".into(), DEFAULT_PIPELINE.into());
+        s.docs = docs;
+        s
+    }
+
+    #[test]
+    fn group_count_shape_charts() {
+        let s = state_with(vec![
+            doc! { "_id": "active", "n": 334 },
+            doc! { "_id": "inactive", "n": 166 },
+        ]);
+        let data = s.chart_data().unwrap();
+        assert_eq!(data[0], ("active".into(), 334));
+        assert_eq!(data[1], ("inactive".into(), 166));
+    }
+
+    #[test]
+    fn falls_back_to_first_numeric_field() {
+        let s = state_with(vec![doc! { "_id": 1, "revenue": 12.6 }]);
+        assert_eq!(s.chart_data().unwrap()[0].1, 13);
+    }
+
+    #[test]
+    fn date_ids_become_sorted_line_series() {
+        use lazymongo_core::bson::DateTime;
+        let s = state_with(vec![
+            doc! { "_id": DateTime::from_millis(2_000), "n": 5 },
+            doc! { "_id": DateTime::from_millis(1_000), "n": 3 },
+        ]);
+        let (points, kind) = s.xy_series().unwrap();
+        assert_eq!(kind, XKind::Date);
+        assert_eq!(points, vec![(1_000.0, 3.0), (2_000.0, 5.0)]); // sorted by x
+        assert_eq!(s.effective_chart_kind(), ChartKind::Line);
+    }
+
+    #[test]
+    fn numeric_ids_chart_as_line_strings_as_bars() {
+        let nums = state_with(vec![doc! { "_id": 20, "n": 1 }, doc! { "_id": 30, "n": 2 }]);
+        assert_eq!(nums.xy_series().unwrap().1, XKind::Number);
+        let cats = state_with(vec![doc! { "_id": "active", "n": 1 }]);
+        assert!(cats.xy_series().is_none());
+        assert_eq!(cats.effective_chart_kind(), ChartKind::Bars);
+    }
+
+    #[test]
+    fn non_chartable_shapes_rejected() {
+        assert!(state_with(vec![]).chart_data().is_none());
+        assert!(state_with(vec![doc! { "_id": 1, "name": "x" }])
+            .chart_data()
+            .is_none());
     }
 }

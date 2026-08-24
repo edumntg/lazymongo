@@ -22,7 +22,7 @@ use crate::input::{char_to_byte, Input};
 use crate::json_view::{doc_lines, RLine};
 use crate::modal::{
     AppAction, Confirm, ConnForm, DocView, EditorPurpose, IndexesView, JsonEditor, Modal, Palette,
-    PendingAction, Prompt, PromptAction, QueryEditor,
+    PendingAction, Prompt, PromptAction, QueryEditor, SchemaView,
 };
 use crate::textarea::TextArea;
 use crate::theme;
@@ -91,23 +91,27 @@ impl Explorer {
     /// Flattened, filtered rows currently visible in the sidebar.
     pub fn rows(&self) -> Vec<ExplorerRow> {
         let needle = self.filter.to_lowercase();
+        let hit =
+            |name: &str| needle.is_empty() || crate::modal::fuzzy_score(&needle, name).is_some();
         let mut rows = Vec::new();
         for (di, node) in self.dbs.iter().enumerate() {
-            let db_match = needle.is_empty() || node.info.name.to_lowercase().contains(&needle);
+            let db_match = hit(&node.info.name);
             // A db whose own name matches shows all of its collections.
             let matching_colls: Vec<usize> = node
                 .colls
                 .iter()
                 .flatten()
                 .enumerate()
-                .filter(|(_, c)| db_match || c.name.to_lowercase().contains(&needle))
+                .filter(|(_, c)| db_match || hit(&c.name))
                 .map(|(i, _)| i)
                 .collect();
             if !db_match && matching_colls.is_empty() {
                 continue;
             }
             rows.push(ExplorerRow::Db(di));
-            if node.expanded {
+            // An active filter virtually expands matching databases so the
+            // results are visible (and openable) immediately.
+            if node.expanded || !needle.is_empty() {
                 for ci in &matching_colls {
                     rows.push(ExplorerRow::Coll { db: di, coll: *ci });
                 }
@@ -271,6 +275,10 @@ pub struct App {
     active_uri: Option<String>,
     /// Set by the `m` key; the run loop suspends the TUI and opens mongosh.
     pub pending_shell: bool,
+    /// Set by Ctrl-E; the run loop suspends the TUI and opens $EDITOR.
+    pub pending_external: Option<(String, String, EditorPurpose)>,
+    /// Set by Ctrl-L; the run loop clears the terminal for a full repaint.
+    pub pending_clear: bool,
     pub toast: Option<(String, bool, Instant)>, // (message, is_error, when)
     pub spinner_frame: usize,
     pub should_quit: bool,
@@ -311,6 +319,8 @@ impl App {
             config_theme: None,
             active_uri: None,
             pending_shell: false,
+            pending_external: None,
+            pending_clear: false,
             toast: None,
             spinner_frame: 0,
             should_quit: false,
@@ -370,6 +380,21 @@ impl App {
                     })
                     .collect();
                 self.explorer.selected = 0;
+                // Prefetch collection names (cheap: one round-trip per db,
+                // counts trickle through a global 4-permit semaphore) so the
+                // Ctrl-T switcher and expansion are instant. Skipped on very
+                // large deployments.
+                if self.explorer.dbs.len() <= 50 {
+                    let names: Vec<String> = self
+                        .explorer
+                        .dbs
+                        .iter()
+                        .map(|n| n.info.name.clone())
+                        .collect();
+                    for db in names {
+                        self.send(Command::ListCollections { db });
+                    }
+                }
             }
             CoreEvent::Collections { db, colls } => {
                 if let Some(node) = self.explorer.dbs.iter_mut().find(|n| n.info.name == db) {
@@ -474,6 +499,25 @@ impl App {
                     self.toast_info("query cancelled".into());
                 }
             }
+            CoreEvent::SchemaSample {
+                db,
+                coll,
+                sampled,
+                fields,
+            } => {
+                if let Modal::Schema(view) = &mut self.modal {
+                    if view.db == db && view.coll == coll {
+                        view.data = Some((sampled, fields));
+                    }
+                }
+            }
+            CoreEvent::ExportDone { path, count } => {
+                self.ops_log.push(format!(
+                    "{}  exported {count} docs to {path}",
+                    util::clock_utc()
+                ));
+                self.toast_info(format!("exported {count} docs to {path}"));
+            }
             CoreEvent::CountResult { req_id, n } => self.on_count_result(req_id, n),
             CoreEvent::Indexes { db, coll, indexes } => {
                 if let Modal::Indexes(view) = &mut self.modal {
@@ -561,12 +605,21 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // Ctrl-L: full repaint (standard terminal convention; also makes
+        // scripted screen-scraping deterministic).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+            self.pending_clear = true;
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('p')
             && self.screen == Screen::Main
             && !self.modal.is_open()
         {
-            return self.open_palette();
+            match key.code {
+                KeyCode::Char('p') => return self.open_palette(),
+                KeyCode::Char('t') => return self.open_ns_switcher(),
+                _ => {}
+            }
         }
         if self.screen == Screen::Agg {
             return self.on_key_agg(key);
@@ -671,6 +724,18 @@ impl App {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.submit_json_editor();
                 }
+                // Shift+Enter submits, like a Colab cell.
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.submit_json_editor();
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let Modal::Editor(editor) = std::mem::replace(&mut self.modal, Modal::None)
+                    else {
+                        return;
+                    };
+                    self.pending_external =
+                        Some((editor.title, editor.area.text(), editor.purpose));
+                }
                 _ => {
                     if editor.area.on_key(key) {
                         editor.error = None;
@@ -760,6 +825,22 @@ impl App {
                         palette.refilter();
                     }
                 }
+            },
+            Modal::Schema(view) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => self.modal = Modal::None,
+                KeyCode::Down | KeyCode::Char('j') => view.scroll += 1,
+                KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
+                KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
+                KeyCode::Char('r') => {
+                    let (db, coll) = (view.db.clone(), view.coll.clone());
+                    view.data = None;
+                    self.send(Command::SampleSchema {
+                        db,
+                        coll,
+                        size: 100,
+                    });
+                }
+                _ => {}
             },
             Modal::Connections { items, selected } => match key.code {
                 // With no connection behind the picker, Esc/q quit the app;
@@ -1000,21 +1081,28 @@ impl App {
 
     /// Parse and route the JSON editor's content on Ctrl-S.
     fn submit_json_editor(&mut self) {
-        let Modal::Editor(editor) = &mut self.modal else {
-            return;
-        };
-        let text = editor.area.text();
-        let parsed = match parse_doc(&text) {
-            Ok(d) => d,
-            Err(e) => {
-                editor.error = Some(e);
-                return;
-            }
-        };
         let Modal::Editor(editor) = std::mem::replace(&mut self.modal, Modal::None) else {
             return;
         };
-        match editor.purpose {
+        let text = editor.area.text();
+        self.process_editor_text(editor.title, text, editor.purpose);
+    }
+
+    /// Parse and route editor content, whether it came from the in-app
+    /// editor (Ctrl-S) or an external $EDITOR session. On parse errors the
+    /// in-app editor reopens with the text and the error banner.
+    fn process_editor_text(&mut self, title: String, text: String, purpose: EditorPurpose) {
+        let parsed = match parse_doc(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                self.modal = Modal::Editor(JsonEditor {
+                    error: Some(e),
+                    ..editor_with(title, text, purpose)
+                });
+                return;
+            }
+        };
+        match purpose {
             EditorPurpose::EditDoc { id, original } => {
                 if let Some(new_id) = parsed.get("_id") {
                     if *new_id != id {
@@ -1022,11 +1110,7 @@ impl App {
                             error: Some(
                                 "_id cannot be changed; revert it or remove the field".into(),
                             ),
-                            ..editor_with(
-                                editor.title,
-                                text,
-                                EditorPurpose::EditDoc { id, original },
-                            )
+                            ..editor_with(title, text, EditorPurpose::EditDoc { id, original })
                         });
                         return;
                     }
@@ -1059,7 +1143,7 @@ impl App {
                 if !parsed.keys().any(|k| k.starts_with('$')) {
                     self.modal = Modal::Editor(JsonEditor {
                         error: Some("update must use operators like $set / $unset / $inc".into()),
-                        ..editor_with(editor.title, text, EditorPurpose::UpdateMany { filter })
+                        ..editor_with(title, text, EditorPurpose::UpdateMany { filter })
                     });
                     return;
                 }
@@ -1072,7 +1156,7 @@ impl App {
                 if parsed.is_empty() {
                     self.modal = Modal::Editor(JsonEditor {
                         error: Some("index key spec cannot be empty".into()),
-                        ..editor_with(editor.title, text, EditorPurpose::CreateIndexKeys)
+                        ..editor_with(title, text, EditorPurpose::CreateIndexKeys)
                     });
                     return;
                 }
@@ -1219,11 +1303,52 @@ impl App {
         for name in theme::NAMES {
             actions.push((format!("theme: {name}"), AppAction::SetTheme(name)));
         }
-        self.modal = Modal::Palette(Palette::new(actions));
+        actions.push((
+            "open collection\u{2026} (ctrl-t)".into(),
+            AppAction::NsSwitcher,
+        ));
+        self.modal = Modal::Palette(Palette::new(
+            "Command palette \u{2500} \u{21b5} run \u{b7} esc close",
+            actions,
+        ));
+    }
+
+    /// Fuzzy switcher over every known db.collection (Ctrl-T).
+    fn open_ns_switcher(&mut self) {
+        let mut actions: Vec<(String, AppAction)> = Vec::new();
+        for node in &self.explorer.dbs {
+            let db = &node.info.name;
+            for coll in node.colls.iter().flatten() {
+                actions.push((
+                    format!("{db}.{}", coll.name),
+                    AppAction::OpenNamespace {
+                        db: db.clone(),
+                        coll: coll.name.clone(),
+                    },
+                ));
+            }
+        }
+        if actions.is_empty() {
+            self.toast_info("collection names still loading\u{2026}".into());
+            return;
+        }
+        self.modal = Modal::Palette(Palette::new(
+            "Open collection \u{2500} \u{21b5} open \u{b7} esc close",
+            actions,
+        ));
     }
 
     fn run_action(&mut self, action: AppAction) {
         match action {
+            AppAction::NsSwitcher => self.open_ns_switcher(),
+            AppAction::OpenNamespace { db, coll } => {
+                self.query.input.clear();
+                self.query.cursor = 0;
+                self.query.error = None;
+                self.extras = SpecExtras::default();
+                self.focus = Pane::Results;
+                self.start_find(db, coll, FindSpec::default());
+            }
             AppAction::ToggleView => {
                 self.view = match self.view {
                     ViewMode::Json => ViewMode::Table,
@@ -1452,12 +1577,26 @@ impl App {
             KeyCode::Enter => self.explorer.filtering = false,
             KeyCode::Backspace => {
                 self.explorer.filter.pop();
+                self.jump_to_first_filter_match();
             }
-            KeyCode::Char(c) => self.explorer.filter.push(c),
+            KeyCode::Char(c) => {
+                self.explorer.filter.push(c);
+                self.jump_to_first_filter_match();
+            }
             _ => {}
         }
         let n = self.explorer.rows().len();
         self.explorer.selected = self.explorer.selected.min(n.saturating_sub(1));
+    }
+
+    /// While filtering, keep the selection on the first matching collection
+    /// (falling back to the first row) so "/name" + Enter + Enter opens it.
+    fn jump_to_first_filter_match(&mut self) {
+        let rows = self.explorer.rows();
+        self.explorer.selected = rows
+            .iter()
+            .position(|r| matches!(r, ExplorerRow::Coll { .. }))
+            .unwrap_or(0);
     }
 
     fn activate_explorer_row(&mut self) {
@@ -1521,6 +1660,9 @@ impl App {
             KeyCode::Char('o') => return self.open_doc_view(),
             KeyCode::Char('y') => return self.copy_current_doc(),
             KeyCode::Char('E') => return self.export_results(),
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return self.edit_current_doc_external()
+            }
             KeyCode::Char('e') => return self.edit_current_doc(),
             KeyCode::Char('i') => return self.insert_doc_flow(),
             KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1533,6 +1675,8 @@ impl App {
                 self.modal = Modal::OpsLog { scroll: 0 };
                 return;
             }
+            KeyCode::Char('S') => return self.open_schema(),
+            KeyCode::Char('c') => return self.duplicate_current_doc(),
             KeyCode::Char('a') => return self.open_agg(),
             KeyCode::Char('m') => return self.open_shell(),
             KeyCode::Char('/') => {
@@ -1596,6 +1740,32 @@ impl App {
         });
     }
 
+    /// Edit the selected document in $EDITOR / $VISUAL (FR-27): the run loop
+    /// suspends the TUI, opens the editor on a temp file, and feeds the saved
+    /// content through the same diff-confirm path as the in-app editor.
+    fn edit_current_doc_external(&mut self) {
+        if !self.guard_write() {
+            return;
+        }
+        let Some(idx) = self.current_doc_idx() else {
+            return;
+        };
+        let doc = self.results.docs[idx].clone();
+        let Some(id) = doc.get("_id").cloned() else {
+            self.toast_err("document has no _id; cannot edit safely".into());
+            return;
+        };
+        self.pending_external = Some((
+            format!("Edit document _id={}", bson_display(&id)),
+            util::doc_to_pretty(&doc),
+            EditorPurpose::EditDoc { id, original: doc },
+        ));
+    }
+
+    pub fn take_external_edit(&mut self) -> Option<(String, String, EditorPurpose)> {
+        self.pending_external.take()
+    }
+
     fn insert_doc_flow(&mut self) {
         if !self.guard_write() {
             return;
@@ -1607,6 +1777,25 @@ impl App {
         self.modal = Modal::Editor(JsonEditor {
             title: "Insert document".into(),
             area: TextArea::from_text("{\n  \n}"),
+            purpose: EditorPurpose::InsertDoc,
+            error: None,
+        });
+    }
+
+    /// Duplicate the selected document: opens the insert editor prefilled
+    /// with a copy (without _id) so a tweaked variant is one Ctrl-S away.
+    fn duplicate_current_doc(&mut self) {
+        if !self.guard_write() {
+            return;
+        }
+        let Some(idx) = self.current_doc_idx() else {
+            return;
+        };
+        let mut doc = self.results.docs[idx].clone();
+        doc.remove("_id");
+        self.modal = Modal::Editor(JsonEditor {
+            title: "Duplicate document (insert a copy)".into(),
+            area: TextArea::from_text(&util::doc_to_pretty(&doc)),
             purpose: EditorPurpose::InsertDoc,
             error: None,
         });
@@ -1715,6 +1904,10 @@ impl App {
         };
         match agg.focus {
             AggFocus::Editor => match key.code {
+                // Shift+Enter runs the full pipeline (Colab-style).
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.run_agg(None);
+                }
                 KeyCode::Esc => {
                     agg.focus = AggFocus::Stages;
                     agg.parse();
@@ -1726,6 +1919,7 @@ impl App {
                 }
             },
             AggFocus::Stages => match key.code {
+                KeyCode::Char('g') => agg.chart = !agg.chart,
                 KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Main,
                 KeyCode::Tab => agg.focus = AggFocus::Results,
                 KeyCode::Char('e') | KeyCode::Char('i') => agg.focus = AggFocus::Editor,
@@ -1743,6 +1937,12 @@ impl App {
                 _ => {}
             },
             AggFocus::Results => match key.code {
+                // g toggles the bar-chart view of the results (Home still
+                // jumps to the top); t cycles the chart kind.
+                KeyCode::Char('g') => agg.chart = !agg.chart,
+                KeyCode::Char('t') if agg.chart => {
+                    agg.chart_kind = agg.chart_kind.next();
+                }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::BackTab => {
                     agg.focus = AggFocus::Stages
                 }
@@ -1751,7 +1951,7 @@ impl App {
                     agg.cursor = (agg.cursor + 1).min(agg.lines.len().saturating_sub(1));
                 }
                 KeyCode::Up | KeyCode::Char('k') => agg.cursor = agg.cursor.saturating_sub(1),
-                KeyCode::Char('g') | KeyCode::Home => agg.cursor = 0,
+                KeyCode::Home => agg.cursor = 0,
                 KeyCode::Char('G') | KeyCode::End => agg.cursor = agg.lines.len().saturating_sub(1),
                 KeyCode::Enter | KeyCode::Char(' ') => agg.toggle_fold_at_cursor(),
                 KeyCode::Char('y') => {
@@ -1803,6 +2003,25 @@ impl App {
             coll,
             pipeline: stages,
             limit: AGG_PREVIEW_LIMIT,
+        });
+    }
+
+    /// Sample 100 docs and show the field presence / type breakdown.
+    fn open_schema(&mut self) {
+        let Some((db, coll)) = self.results.target.clone() else {
+            self.toast_err("select a collection first".into());
+            return;
+        };
+        self.modal = Modal::Schema(SchemaView {
+            db: db.clone(),
+            coll: coll.clone(),
+            data: None,
+            scroll: 0,
+        });
+        self.send(Command::SampleSchema {
+            db,
+            coll,
+            size: 100,
         });
     }
 
@@ -1933,28 +2152,37 @@ impl App {
         }
     }
 
-    /// Export the loaded window: JSON array in JSON view, CSV in table view.
+    /// Export the FULL active query by streaming the cursor to a file
+    /// (bounded memory, not just the loaded window). JSON view exports a
+    /// JSON array; table view exports CSV over the current columns.
     fn export_results(&mut self) {
         let Some((db, coll)) = self.results.target.clone() else {
+            self.toast_err("select a collection first".into());
             return;
         };
-        if self.results.docs.is_empty() {
-            self.toast_err("nothing to export".into());
-            return;
-        }
-        let result = match self.view {
-            ViewMode::Json => util::export_json(&db, &coll, &self.results.docs),
-            ViewMode::Table => {
-                util::export_csv(&db, &coll, &self.results.table.columns, &self.results.docs)
-            }
+        let (format, ext, columns) = match self.view {
+            ViewMode::Json => (lazymongo_core::types::ExportFormat::Json, "json", vec![]),
+            ViewMode::Table => (
+                lazymongo_core::types::ExportFormat::Csv,
+                "csv",
+                self.results.table.columns.clone(),
+            ),
         };
-        match result {
-            Ok(path) => self.toast_info(format!(
-                "exported {} docs to {path}",
-                self.results.docs.len()
-            )),
-            Err(e) => self.toast_err(format!("export failed: {e}")),
-        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = format!("lazymongo-{db}.{coll}-{ts}.{ext}");
+        self.toast_info(format!("exporting to {path} (streaming)"));
+        let spec = self.results.active_spec.clone();
+        self.send(Command::ExportQuery {
+            db,
+            coll,
+            spec,
+            format,
+            columns,
+            path,
+        });
     }
 
     /// Typing mode for in-results search (FR-26): live-jumps as you type.
@@ -2537,8 +2765,63 @@ pub async fn run(terminal: &mut term::Term, uri: Option<String>, read_only: bool
                 run_mongosh(terminal, &mut app, &uri);
             }
         }
+        if let Some((title, text, purpose)) = app.take_external_edit() {
+            run_external_editor(terminal, &mut app, title, text, purpose);
+        }
+        if app.pending_clear {
+            app.pending_clear = false;
+            let _ = terminal.clear();
+        }
     }
     Ok(())
+}
+
+/// Suspend the TUI, open $VISUAL/$EDITOR on the content, resume, and route
+/// the saved text through the normal editor-submission path.
+fn run_external_editor(
+    terminal: &mut term::Term,
+    app: &mut App,
+    title: String,
+    text: String,
+    purpose: EditorPurpose,
+) {
+    let editor_cmd = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut parts = editor_cmd.split_whitespace();
+    let Some(bin) = parts.next() else {
+        app.toast_err("EDITOR is empty".into());
+        return;
+    };
+    let args: Vec<&str> = parts.collect();
+    let path = std::env::temp_dir().join(format!("lazymongo-edit-{}.json", std::process::id()));
+    if let Err(e) = std::fs::write(&path, &text) {
+        app.toast_err(format!("could not write temp file: {e}"));
+        return;
+    }
+
+    term::restore();
+    let status = std::process::Command::new(bin)
+        .args(&args)
+        .arg(&path)
+        .status();
+    let _ = term::reenter(terminal);
+
+    match status {
+        Err(e) => app.toast_err(format!("could not launch {editor_cmd}: {e}")),
+        Ok(st) if !st.success() => app.toast_info("edit aborted (editor exited nonzero)".into()),
+        Ok(_) => match std::fs::read_to_string(&path) {
+            Err(e) => app.toast_err(format!("could not read edited file: {e}")),
+            Ok(edited) => {
+                if edited.trim() == text.trim() {
+                    app.toast_info("no changes".into());
+                } else {
+                    app.process_editor_text(title, edited, purpose);
+                }
+            }
+        },
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Suspend the TUI, run mongosh attached to this terminal, resume.

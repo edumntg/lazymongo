@@ -5,7 +5,9 @@
 //! render path.
 
 pub mod actor;
+pub mod display;
 pub mod query;
+pub mod schema;
 pub mod types;
 
 /// Re-export the driver's bson so every crate uses the exact same version.

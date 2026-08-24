@@ -19,6 +19,12 @@ pub struct CollectionInfo {
     pub estimated_count: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Json,
+    Csv,
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexInfo {
     pub name: String,
@@ -72,6 +78,23 @@ pub enum Command {
         db: String,
         coll: String,
         filter: Document,
+    },
+    /// Stream the full result of a find to a file (not just the loaded
+    /// window). Runs detached; finishes with ExportDone or Error.
+    ExportQuery {
+        db: String,
+        coll: String,
+        spec: FindSpec,
+        format: ExportFormat,
+        /// Column order for CSV (ignored for JSON).
+        columns: Vec<String>,
+        path: String,
+    },
+    /// Sample documents and analyze the top-level schema.
+    SampleSchema {
+        db: String,
+        coll: String,
+        size: u32,
     },
     /// One-shot aggregation preview, capped at `limit` result docs (FR-18).
     Aggregate {
@@ -181,6 +204,18 @@ pub enum CoreEvent {
         docs: Vec<Document>,
         /// True when the cursor is exhausted (no more batches).
         exhausted: bool,
+    },
+    /// Result of SampleSchema.
+    SchemaSample {
+        db: String,
+        coll: String,
+        sampled: usize,
+        fields: Vec<crate::schema::FieldStat>,
+    },
+    /// A streaming export finished successfully.
+    ExportDone {
+        path: String,
+        count: u64,
     },
     /// Estimated total for an unfiltered find; computed in the background so
     /// it never delays the first batch.

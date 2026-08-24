@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use lazymongo_core::bson::{Bson, Document};
+use lazymongo_core::schema::FieldStat;
 use lazymongo_core::types::IndexInfo;
 
 use crate::config::SavedConnection;
@@ -32,6 +33,8 @@ pub enum Modal {
     ConnForm(ConnForm),
     /// Fuzzy command palette (FR-36).
     Palette(Palette),
+    /// Sampled schema of a collection (field presence + types).
+    Schema(SchemaView),
 }
 
 impl Modal {
@@ -262,6 +265,15 @@ impl ConnForm {
     }
 }
 
+/// Sampled schema of the current collection.
+pub struct SchemaView {
+    pub db: String,
+    pub coll: String,
+    /// None while the sample is loading.
+    pub data: Option<(usize, Vec<FieldStat>)>,
+    pub scroll: usize,
+}
+
 /// What a submitted prompt value is used for.
 pub enum PromptAction {
     CreateCollection { db: String },
@@ -275,8 +287,14 @@ pub struct Prompt {
 }
 
 /// Every UI action reachable from the command palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
+    /// Open a collection directly (namespace switcher, Ctrl-T).
+    OpenNamespace {
+        db: String,
+        coll: String,
+    },
+    NsSwitcher,
     ToggleView,
     QueryEditor,
     Explain,
@@ -301,6 +319,7 @@ pub enum AppAction {
 
 /// Fuzzy command palette (FR-36): every feature reachable by name.
 pub struct Palette {
+    pub title: String,
     pub input: Input,
     pub actions: Vec<(String, AppAction)>,
     /// Indices into `actions`, best match first.
@@ -309,9 +328,10 @@ pub struct Palette {
 }
 
 impl Palette {
-    pub fn new(actions: Vec<(String, AppAction)>) -> Self {
+    pub fn new(title: impl Into<String>, actions: Vec<(String, AppAction)>) -> Self {
         let filtered = (0..actions.len()).collect();
         Self {
+            title: title.into(),
             input: Input::default(),
             actions,
             filtered,
@@ -333,7 +353,9 @@ impl Palette {
     }
 
     pub fn selected_action(&self) -> Option<AppAction> {
-        self.filtered.get(self.selected).map(|&i| self.actions[i].1)
+        self.filtered
+            .get(self.selected)
+            .map(|&i| self.actions[i].1.clone())
     }
 }
 
@@ -348,6 +370,11 @@ pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     let mut hi = 0usize;
     let mut last_hit: Option<usize> = None;
     for nc in needle.chars() {
+        // Spaces are soft separators: "app users" matches "app_db.users".
+        if nc == ' ' {
+            last_hit = None;
+            continue;
+        }
         let mut found = None;
         while hi < hay.len() {
             if hay[hi] == nc {
@@ -374,6 +401,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spaces_are_soft_separators() {
+        assert!(fuzzy_score("app users", "app_db.users").is_some());
+        assert!(fuzzy_score("smoke items", "smoke_db.items").is_some());
+        assert!(fuzzy_score("app zz", "app_db.users").is_none());
+    }
+
+    #[test]
     fn fuzzy_basics() {
         assert!(fuzzy_score("", "anything").is_some());
         assert!(fuzzy_score("tbl", "view: toggle json/table (v)").is_some());
@@ -386,11 +420,14 @@ mod tests {
 
     #[test]
     fn palette_filters_and_ranks() {
-        let mut p = Palette::new(vec![
-            ("view: toggle json/table".into(), AppAction::ToggleView),
-            ("theme: dark".into(), AppAction::SetTheme("dark")),
-            ("theme: termius".into(), AppAction::SetTheme("termius")),
-        ]);
+        let mut p = Palette::new(
+            "t",
+            vec![
+                ("view: toggle json/table".into(), AppAction::ToggleView),
+                ("theme: dark".into(), AppAction::SetTheme("dark")),
+                ("theme: termius".into(), AppAction::SetTheme("termius")),
+            ],
+        );
         p.input = Input::with_text("theme");
         p.refilter();
         assert_eq!(p.filtered.len(), 2);

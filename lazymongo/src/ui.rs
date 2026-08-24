@@ -6,16 +6,19 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 
 use crate::theme;
+use ratatui::symbols;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{
+    Axis, BarChart, Block, BorderType, Chart, Clear, Dataset, GraphType, Paragraph,
+};
 use ratatui::Frame;
 
-use crate::agg::{AggFocus, AggState};
+use crate::agg::{AggFocus, AggState, ChartKind, XKind};
 use crate::app::{App, ConnState, ExplorerRow, Pane, Screen, ViewMode};
 use crate::config::SavedConnection;
 use crate::modal::{
     Confirm, ConnForm, DocView, IndexesView, JsonEditor, Modal, Palette, Prompt, QueryEditor,
-    CONN_FIELD_LABELS, QUERY_FIELD_LABELS,
+    SchemaView, CONN_FIELD_LABELS, QUERY_FIELD_LABELS,
 };
 use crate::util;
 
@@ -157,6 +160,14 @@ fn draw_explorer(f: &mut Frame, app: &mut App, area: Rect) {
     let mut title = String::from(" 1 Explorer ");
     if app.explorer.loading {
         title = format!(" 1 Explorer {} ", spinner(app));
+    }
+    // Discoverability: long lists advertise the filter shortcut.
+    if focused
+        && !app.explorer.filtering
+        && app.explorer.filter.is_empty()
+        && app.explorer.rows().len() > 12
+    {
+        title.push_str("(/ to filter) ");
     }
     if app.explorer.filtering || !app.explorer.filter.is_empty() {
         title.push_str(&format!("/{}", app.explorer.filter));
@@ -545,7 +556,12 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
                 ("esc", "close"),
             ],
             Modal::QueryEditor(_) => &[("tab/↑↓", "field"), ("↵", "run"), ("esc", "cancel")],
-            Modal::Editor(_) => &[("type", "edit json"), ("^s", "save"), ("esc", "cancel")],
+            Modal::Editor(_) => &[
+                ("type", "edit json"),
+                ("^s/\u{21e7}\u{21b5}", "save"),
+                ("^e", "$EDITOR"),
+                ("esc", "cancel"),
+            ],
             Modal::Confirm(c) if c.typed_required.is_some() => &[
                 ("type", "confirm text"),
                 ("↵", "confirm"),
@@ -612,6 +628,7 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
                     ("x", "explain"),
                     ("e", "edit"),
                     ("i", "insert"),
+                    ("c", "duplicate"),
                     ("d", "delete"),
                     ("?", "help"),
                 ],
@@ -677,7 +694,59 @@ fn draw_modal(f: &mut Frame, app: &mut App) {
         Modal::Connections { items, selected } => draw_connections(f, f.area(), items, *selected),
         Modal::ConnForm(form) => draw_conn_form(f, f.area(), form),
         Modal::Palette(palette) => draw_palette(f, f.area(), palette),
+        Modal::Schema(view) => draw_schema(f, f.area(), view, spin),
     }
+}
+
+fn draw_schema(f: &mut Frame, area: Rect, view: &mut SchemaView, spin: &str) {
+    let popup = centered(area, 78, area.height.saturating_sub(6));
+    f.render_widget(Clear, popup);
+    let title = match &view.data {
+        None => format!(" Schema ─ {}.{} {spin} sampling… ", view.db, view.coll),
+        Some((sampled, _)) => format!(
+            " Schema ─ {}.{} (sample of {sampled}) ─ r resample · esc close ",
+            view.db, view.coll
+        ),
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::accent()))
+        .title(title);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let Some((sampled, fields)) = &view.data else {
+        return;
+    };
+    let sampled = (*sampled).max(1);
+    view.scroll = view.scroll.min(fields.len().saturating_sub(1));
+    let bar_w = 20usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {:<22}", "field"), Style::new().fg(theme::dim())),
+        Span::styled(format!("{:<26}", "presence"), Style::new().fg(theme::dim())),
+        Span::styled("types", Style::new().fg(theme::dim())),
+    ]));
+    for stat in fields
+        .iter()
+        .skip(view.scroll)
+        .take(inner.height.saturating_sub(1) as usize)
+    {
+        let pct = f64::from(stat.present) * 100.0 / sampled as f64;
+        let filled = ((pct / 100.0) * bar_w as f64).round() as usize;
+        let bar: String = "█".repeat(filled.min(bar_w)) + &"░".repeat(bar_w - filled.min(bar_w));
+        let mut name = stat.name.clone();
+        if name.chars().count() > 21 {
+            name = name.chars().take(20).collect::<String>() + "…";
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {name:<22}"), Style::new().fg(theme::key())),
+            Span::styled(bar, Style::new().fg(theme::accent())),
+            Span::styled(format!(" {pct:>3.0}%  "), Style::new().fg(theme::text())),
+            Span::styled(stat.types.join(" | "), Style::new().fg(theme::dim())),
+        ]));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn draw_palette(f: &mut Frame, area: Rect, palette: &Palette) {
@@ -687,7 +756,7 @@ fn draw_palette(f: &mut Frame, area: Rect, palette: &Palette) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme::accent()))
-        .title(" Command palette ─ ↵ run · esc close ");
+        .title(format!(" {} ", palette.title));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -849,7 +918,7 @@ fn draw_agg_screen(f: &mut Frame, app: &mut App) {
     let entries: &[(&str, &str)] = match app.agg.as_ref().map(|a| a.focus) {
         Some(AggFocus::Editor) => &[
             ("type", "edit pipeline"),
-            ("^r", "run all"),
+            ("\u{21e7}\u{21b5}/^r", "run all"),
             ("esc", "stages"),
         ],
         Some(AggFocus::Stages) => &[
@@ -863,6 +932,8 @@ fn draw_agg_screen(f: &mut Frame, app: &mut App) {
         _ => &[
             ("↑↓/jk", "move"),
             ("↵", "fold"),
+            ("g", "chart"),
+            ("t", "chart kind"),
             ("y", "copy"),
             ("esc", "stages"),
         ],
@@ -894,6 +965,147 @@ fn draw_agg_screen(f: &mut Frame, app: &mut App) {
     draw_agg_stages(f, agg, stages_a);
     draw_agg_editor(f, agg, editor_a);
     draw_agg_results(f, agg, results_a, spin);
+}
+
+/// Bar chart of {_id, number}-shaped aggregation results (e.g. $group +
+/// $sum) — Compass-charts energy, zero extra dependencies.
+fn draw_agg_chart(f: &mut Frame, agg: &AggState, inner: Rect) {
+    match agg.effective_chart_kind() {
+        ChartKind::Line => return draw_agg_xy(f, agg, inner, GraphType::Line),
+        ChartKind::Scatter => return draw_agg_xy(f, agg, inner, GraphType::Scatter),
+        _ => {}
+    }
+    let Some(data) = agg.chart_data() else {
+        f.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "  These results are not chart-shaped.",
+                    Style::new().fg(theme::warn()),
+                )),
+                Line::from(Span::styled(
+                    "  Charts need { _id, <number> } docs — e.g. a $group with $sum/$count.",
+                    Style::new().fg(theme::dim()),
+                )),
+            ])),
+            inner,
+        );
+        return;
+    };
+    // Fit bars to the width; labels are truncated to the bar width.
+    let n = data.len() as u16;
+    let gap = 1u16;
+    let bar_width = ((inner.width.saturating_sub(n * gap)) / n.max(1)).clamp(3, 14);
+    let visible = (inner.width / (bar_width + gap)).max(1) as usize;
+    let shown: Vec<(String, u64)> = data
+        .into_iter()
+        .take(visible)
+        .map(|(label, v)| {
+            let short: String = label.chars().take(bar_width as usize).collect();
+            (short, v)
+        })
+        .collect();
+    let refs: Vec<(&str, u64)> = shown.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+    let chart = BarChart::default()
+        .data(&refs)
+        .bar_width(bar_width)
+        .bar_gap(gap)
+        .bar_style(Style::new().fg(theme::accent()))
+        .value_style(
+            Style::new()
+                .fg(theme::badge_fg())
+                .bg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        )
+        .label_style(Style::new().fg(theme::key()));
+    f.render_widget(chart, inner);
+}
+
+/// Format an X coordinate for axis labels.
+fn fmt_x(x: f64, kind: XKind) -> String {
+    match kind {
+        XKind::Number => {
+            if x.fract() == 0.0 && x.abs() < 1e15 {
+                format!("{}", x as i64)
+            } else {
+                format!("{x:.2}")
+            }
+        }
+        XKind::Date => lazymongo_core::bson::DateTime::from_millis(x as i64)
+            .try_to_rfc3339_string()
+            .map(|s| {
+                // "2026-08-24T15:04:05Z" -> "08-24 15:04"
+                s.get(5..16).map(|t| t.replace('T', " ")).unwrap_or(s)
+            })
+            .unwrap_or_else(|_| format!("{x}")),
+    }
+}
+
+/// Line / scatter chart over {_id: date|number, value} results.
+fn draw_agg_xy(f: &mut Frame, agg: &AggState, inner: Rect, graph: GraphType) {
+    let Some((points, xkind)) = agg.xy_series() else {
+        f.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "  Line/scatter need date or numeric _id values.",
+                    Style::new().fg(theme::warn()),
+                )),
+                Line::from(Span::styled(
+                    "  Group by a date/number (e.g. $dateTrunc) — or press t for bars.",
+                    Style::new().fg(theme::dim()),
+                )),
+            ])),
+            inner,
+        );
+        return;
+    };
+    let (mut x_min, mut x_max) = (points[0].0, points[points.len() - 1].0);
+    let mut y_min = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let mut y_max = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    // Pad degenerate bounds so single points / flat lines still render.
+    if x_min == x_max {
+        x_min -= 1.0;
+        x_max += 1.0;
+    }
+    if y_min == y_max {
+        y_min -= 1.0;
+        y_max += 1.0;
+    }
+    y_min = y_min.min(0.0);
+    y_max += (y_max - y_min) * 0.05;
+
+    let x_mid = (x_min + x_max) / 2.0;
+    let y_mid = (y_min + y_max) / 2.0;
+    let axis_style = Style::new().fg(theme::dim());
+    let label = |t: String| Span::styled(t, Style::new().fg(theme::dim()));
+    let dataset = Dataset::default()
+        .marker(symbols::Marker::Braille)
+        .graph_type(graph)
+        .style(Style::new().fg(theme::accent()))
+        .data(&points);
+    let chart = Chart::new(vec![dataset])
+        .x_axis(
+            Axis::default()
+                .style(axis_style)
+                .bounds([x_min, x_max])
+                .labels(vec![
+                    label(fmt_x(x_min, xkind)),
+                    label(fmt_x(x_mid, xkind)),
+                    label(fmt_x(x_max, xkind)),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .style(axis_style)
+                .bounds([y_min, y_max])
+                .labels(vec![
+                    label(format!("{y_min:.0}")),
+                    label(format!("{y_mid:.0}")),
+                    label(format!("{y_max:.0}")),
+                ]),
+        );
+    f.render_widget(chart, inner);
 }
 
 fn draw_agg_stages(f: &mut Frame, agg: &AggState, area: Rect) {
@@ -942,7 +1154,7 @@ fn draw_agg_editor(f: &mut Frame, agg: &mut AggState, area: Rect) {
             Span::styled(e.clone(), Style::new().fg(theme::error())),
             Span::raw(" "),
         ]),
-        None => Line::raw(" Pipeline (json5, ^r runs) "),
+        None => Line::raw(" Pipeline (json5 · \u{21e7}\u{21b5}/^r run) "),
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -957,14 +1169,21 @@ fn draw_agg_results(f: &mut Frame, agg: &mut AggState, area: Rect, spin: &str) {
     let focused = agg.focus == AggFocus::Results;
     let mut title = match agg.ran_through {
         Some(r) => format!(
-            " Preview ─ through stage {} ({} docs{}) ",
+            " Preview{} ─ through stage {} ({} docs{}) ─ g {}{} ",
+            if agg.chart {
+                format!(" [chart:{}]", agg.effective_chart_kind().label())
+            } else {
+                String::new()
+            },
             r + 1,
             agg.docs.len(),
             if agg.docs.len() >= crate::agg::AGG_PREVIEW_LIMIT {
                 ", capped"
             } else {
                 ""
-            }
+            },
+            if agg.chart { "json" } else { "chart" },
+            if agg.chart { " · t kind" } else { "" },
         ),
         None => " Preview ─ run the pipeline (↵ on a stage / ^r) ".to_string(),
     };
@@ -978,6 +1197,11 @@ fn draw_agg_results(f: &mut Frame, agg: &mut AggState, area: Rect, spin: &str) {
         .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    if agg.chart && agg.ran_through.is_some() {
+        draw_agg_chart(f, agg, inner);
+        return;
+    }
 
     let height = inner.height as usize;
     let len = agg.lines.len();
@@ -1055,7 +1279,7 @@ fn draw_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
 fn draw_json_editor(f: &mut Frame, area: Rect, editor: &mut JsonEditor) {
     let popup = centered(area, 84, area.height.saturating_sub(6));
     f.render_widget(Clear, popup);
-    let title = format!(" {} ─ ^s save · esc cancel ", editor.title);
+    let title = format!(" {} ─ ^s/\u{21e7}\u{21b5} save · esc cancel ", editor.title);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme::accent()))
@@ -1271,6 +1495,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("r"), txt("refresh current pane")]),
         Line::from(vec![key("C"), txt("connection manager (add/edit/switch)")]),
         Line::from(vec![key("^p / :"), txt("command palette (incl. themes)")]),
+        Line::from(vec![key("^t"), txt("open collection by name (fuzzy)")]),
         Line::from(vec![key("?"), txt("toggle this help")]),
         Line::raw(""),
         head("Explorer"),
@@ -1287,10 +1512,17 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("x"), txt("explain query plan")]),
         Line::from(vec![key("o"), txt("open document full-screen")]),
         Line::from(vec![key("y"), txt("copy document to clipboard")]),
-        Line::from(vec![key("E"), txt("export loaded docs (json / csv)")]),
+        Line::from(vec![
+            key("E"),
+            txt("export FULL query to file (json / csv, streamed)"),
+        ]),
         Line::from(vec![
             key("a"),
-            txt("aggregation editor (stage-by-stage preview)"),
+            txt("aggregation editor (g toggles bar chart)"),
+        ]),
+        Line::from(vec![
+            key("S"),
+            txt("schema: sampled field presence & types"),
         ]),
         Line::from(vec![key("m"), txt("open mongosh on this connection")]),
         Line::from(vec![
@@ -1300,7 +1532,11 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(vec![key("esc"), txt("cancel a running query")]),
         Line::raw(""),
         head("Writes (blocked in read-only mode)"),
-        Line::from(vec![key("e / i"), txt("edit document · insert document")]),
+        Line::from(vec![key("e / ^e"), txt("edit document (in-app / $EDITOR)")]),
+        Line::from(vec![
+            key("i / c"),
+            txt("insert document · duplicate selected"),
+        ]),
         Line::from(vec![
             key("d / D"),
             txt("delete doc · delete by filter (dry run)"),

@@ -14,21 +14,7 @@ pub fn doc_to_pretty(doc: &Document) -> String {
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{doc:?}"))
 }
 
-/// Compact single-line form for CSV cells and summaries.
-pub fn bson_to_compact(v: &Bson) -> String {
-    match v {
-        Bson::String(s) => s.clone(),
-        Bson::ObjectId(oid) => oid.to_string(),
-        Bson::DateTime(dt) => dt
-            .try_to_rfc3339_string()
-            .unwrap_or_else(|_| format!("{dt}")),
-        Bson::Document(d) => format!("{{…{}}}", d.len()),
-        Bson::Array(a) => format!("[…{}]", a.len()),
-        Bson::Null => String::new(),
-        Bson::Binary(b) => format!("Binary({} bytes)", b.bytes.len()),
-        other => other.to_string(),
-    }
-}
+pub use lazymongo_core::display::bson_to_compact;
 
 /// Copy text to the system clipboard by shelling out (no heavy deps).
 pub fn clipboard_copy(text: &str) -> Result<(), String> {
@@ -74,56 +60,6 @@ fn timestamp() -> u64 {
 pub fn clock_utc() -> String {
     let s = timestamp();
     format!("{:02}:{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60, s % 60)
-}
-
-/// Export loaded docs as a pretty JSON array. Returns the file path.
-pub fn export_json(db: &str, coll: &str, docs: &[Document]) -> Result<String, String> {
-    let path = format!("lazymongo-{db}.{coll}-{}.json", timestamp());
-    let values: Vec<serde_json::Value> = docs
-        .iter()
-        .map(|d| Bson::Document(d.clone()).into_relaxed_extjson())
-        .collect();
-    let body = serde_json::to_string_pretty(&values).map_err(|e| e.to_string())?;
-    std::fs::write(&path, body).map_err(|e| e.to_string())?;
-    Ok(path)
-}
-
-/// Export loaded docs as CSV over the given columns. Returns the file path.
-pub fn export_csv(
-    db: &str,
-    coll: &str,
-    columns: &[String],
-    docs: &[Document],
-) -> Result<String, String> {
-    let path = format!("lazymongo-{db}.{coll}-{}.csv", timestamp());
-    let mut out = String::new();
-    out.push_str(
-        &columns
-            .iter()
-            .map(|c| csv_escape(c))
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    out.push('\n');
-    for doc in docs {
-        let row: Vec<String> = columns
-            .iter()
-            .map(|c| doc.get(c).map(bson_to_compact).unwrap_or_default())
-            .map(|s| csv_escape(&s))
-            .collect();
-        out.push_str(&row.join(","));
-        out.push('\n');
-    }
-    std::fs::write(&path, out).map_err(|e| e.to_string())?;
-    Ok(path)
-}
-
-fn csv_escape(s: &str) -> String {
-    if s.contains([',', '"', '\n']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
 }
 
 /// Recursively search an explain plan for a COLLSCAN stage (FR-15).

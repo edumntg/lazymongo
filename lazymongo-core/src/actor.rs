@@ -10,9 +10,10 @@ use mongodb::options::ClientOptions;
 use mongodb::{Client, Cursor, IndexModel};
 use tokio::sync::{mpsc, watch};
 
+use crate::display::{bson_to_compact, csv_escape};
 use crate::types::{
-    pipeline_writes, CollectionInfo, Command, CoreEvent, DatabaseInfo, FindSpec, IndexInfo,
-    BATCH_SIZE, FIRST_BATCH_SIZE,
+    pipeline_writes, CollectionInfo, Command, CoreEvent, DatabaseInfo, ExportFormat, FindSpec,
+    IndexInfo, BATCH_SIZE, FIRST_BATCH_SIZE,
 };
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
@@ -20,9 +21,13 @@ const SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Server-side guardrails (FR-16).
 const FIND_MAX_TIME: Duration = Duration::from_secs(30);
 const COUNT_MAX_TIME: Duration = Duration::from_secs(15);
-/// Concurrent estimated-count commands while filling the sidebar. Kept well
-/// below the pool size so interactive queries never wait for a connection.
+/// Concurrent estimated-count commands while filling the sidebar. A global
+/// semaphore (not per-db) kept well below the pool size, so even listing many
+/// databases at once never starves interactive queries of connections.
 const COUNT_CONCURRENCY: usize = 4;
+static COUNT_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(COUNT_CONCURRENCY);
+/// Streaming exports may legitimately take a while.
+const EXPORT_MAX_TIME: Duration = Duration::from_secs(600);
 /// Driver pool size (default is 10, which background counts could exhaust).
 const MAX_POOL_SIZE: u32 = 20;
 
@@ -136,6 +141,18 @@ impl Actor {
                 coll,
                 filter,
             } => self.count(req_id, db, coll, filter).await,
+            Command::ExportQuery {
+                db,
+                coll,
+                spec,
+                format,
+                columns,
+                path,
+            } => {
+                self.export_query(db, coll, spec, format, columns, path)
+                    .await
+            }
+            Command::SampleSchema { db, coll, size } => self.sample_schema(db, coll, size).await,
             Command::Aggregate {
                 generation,
                 db,
@@ -280,9 +297,12 @@ impl Actor {
                 tokio::spawn(async move {
                     let mut counts = futures_util::stream::iter(names.into_iter().map(|name| {
                         let coll = database.collection::<Document>(&name);
-                        async move { (name, coll.estimated_document_count().await.ok()) }
+                        async move {
+                            let _permit = COUNT_PERMITS.acquire().await;
+                            (name, coll.estimated_document_count().await.ok())
+                        }
                     }))
-                    .buffer_unordered(COUNT_CONCURRENCY);
+                    .buffer_unordered(COUNT_CONCURRENCY * 4);
                     while let Some((coll, count)) = counts.next().await {
                         // Errors (e.g. views don't support the count) just
                         // leave the count blank in the sidebar.
@@ -509,6 +529,62 @@ impl Actor {
                 Self::emit(&self.events, CoreEvent::AggBatch { generation, docs }).await;
             }
             Some(Err(e)) => Self::emit_err(&self.events, format!("aggregate: {e}")).await,
+        }
+    }
+
+    /// Stream the full query result to a file in a detached task (FR-24).
+    /// Unlike the on-screen window, this walks the entire cursor.
+    async fn export_query(
+        &mut self,
+        db: String,
+        coll: String,
+        spec: FindSpec,
+        format: ExportFormat,
+        columns: Vec<String>,
+        path: String,
+    ) {
+        if !self.connected() {
+            return;
+        }
+        let collection = self.coll(&db, &coll);
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = stream_export(collection, spec, format, columns, &path).await;
+            match result {
+                Ok(count) => {
+                    let _ = events.send(CoreEvent::ExportDone { path, count }).await;
+                }
+                Err(e) => {
+                    let _ = events.send(CoreEvent::Error(format!("export: {e}"))).await;
+                }
+            }
+        });
+    }
+
+    /// Random-sample `size` docs and emit the top-level schema analysis.
+    async fn sample_schema(&mut self, db: String, coll: String, size: u32) {
+        if !self.connected() {
+            return;
+        }
+        let pipeline = vec![doc! { "$sample": { "size": size } }];
+        match self.coll(&db, &coll).aggregate(pipeline).await {
+            Ok(cursor) => match cursor.try_collect::<Vec<Document>>().await {
+                Ok(docs) => {
+                    let fields = crate::schema::analyze(&docs);
+                    Self::emit(
+                        &self.events,
+                        CoreEvent::SchemaSample {
+                            db,
+                            coll,
+                            sampled: docs.len(),
+                            fields,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => Self::emit_err(&self.events, format!("schema sample: {e}")).await,
+            },
+            Err(e) => Self::emit_err(&self.events, format!("schema sample: {e}")).await,
         }
     }
 
@@ -759,4 +835,70 @@ fn display_id(id: &Bson) -> String {
         Bson::ObjectId(oid) => oid.to_string(),
         other => other.to_string(),
     }
+}
+
+/// Walk the whole cursor for `spec`, writing docs to `path` incrementally
+/// (bounded memory regardless of result size). Returns the doc count.
+async fn stream_export(
+    collection: mongodb::Collection<Document>,
+    spec: FindSpec,
+    format: ExportFormat,
+    columns: Vec<String>,
+    path: &str,
+) -> anyhow::Result<u64> {
+    use std::io::Write as _;
+
+    let mut find = collection
+        .find(spec.filter)
+        .batch_size(1000)
+        .max_time(EXPORT_MAX_TIME);
+    if let Some(p) = spec.projection {
+        find = find.projection(p);
+    }
+    if let Some(s) = spec.sort {
+        find = find.sort(s);
+    }
+    if let Some(l) = spec.limit {
+        find = find.limit(l);
+    }
+    if let Some(s) = spec.skip {
+        find = find.skip(s);
+    }
+    let mut cursor = find.await?;
+
+    let file = std::fs::File::create(path)?;
+    let mut out = std::io::BufWriter::new(file);
+    let mut count = 0u64;
+    match format {
+        ExportFormat::Json => {
+            out.write_all(b"[")?;
+            while let Some(doc) = cursor.try_next().await? {
+                if count > 0 {
+                    out.write_all(b",")?;
+                }
+                let value = mongodb::bson::Bson::Document(doc).into_relaxed_extjson();
+                out.write_all(b"\n")?;
+                serde_json::to_writer(&mut out, &value)?;
+                count += 1;
+            }
+            out.write_all(b"\n]\n")?;
+        }
+        ExportFormat::Csv => {
+            let header: Vec<String> = columns.iter().map(|c| csv_escape(c)).collect();
+            out.write_all(header.join(",").as_bytes())?;
+            out.write_all(b"\n")?;
+            while let Some(doc) = cursor.try_next().await? {
+                let row: Vec<String> = columns
+                    .iter()
+                    .map(|c| doc.get(c).map(bson_to_compact).unwrap_or_default())
+                    .map(|s| csv_escape(&s))
+                    .collect();
+                out.write_all(row.join(",").as_bytes())?;
+                out.write_all(b"\n")?;
+                count += 1;
+            }
+        }
+    }
+    out.flush()?;
+    Ok(count)
 }
