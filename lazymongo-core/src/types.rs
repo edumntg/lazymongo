@@ -19,6 +19,30 @@ pub struct CollectionInfo {
     pub estimated_count: Option<u64>,
 }
 
+/// DNS resolver used for mongodb+srv lookups. The system resolver is the
+/// default; public resolvers are the standard workaround when local/VPN DNS
+/// mangles SRV/TXT responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DnsResolver {
+    #[default]
+    System,
+    Cloudflare,
+    Google,
+    Quad9,
+}
+
+impl DnsResolver {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "system" => Some(Self::System),
+            "cloudflare" => Some(Self::Cloudflare),
+            "google" => Some(Self::Google),
+            "quad9" => Some(Self::Quad9),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
     Json,
@@ -47,6 +71,7 @@ pub struct FindSpec {
 pub enum Command {
     Connect {
         uri: String,
+        dns: DnsResolver,
     },
     /// Toggle read-only enforcement (used by the connection picker).
     SetReadOnly(bool),

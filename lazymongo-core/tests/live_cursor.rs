@@ -13,7 +13,12 @@ async fn new_find_with_live_cursor() {
         return;
     };
     let (cmd, mut evt, _cancel) = actor::spawn(false);
-    cmd.send(Command::Connect { uri }).await.unwrap();
+    cmd.send(Command::Connect {
+        uri,
+        dns: lazymongo_core::types::DnsResolver::System,
+    })
+    .await
+    .unwrap();
     loop {
         if let CoreEvent::Connected { .. } = timeout(Duration::from_secs(10), evt.recv())
             .await

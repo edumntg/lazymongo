@@ -42,6 +42,11 @@ pub struct Config {
     /// Theme name (see theme::NAMES); None = default dark.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// DNS resolver for mongodb+srv lookups: "system" (default),
+    /// "cloudflare", "google", or "quad9" — use a public one if your
+    /// local/VPN DNS mangles SRV records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<String>,
     #[serde(default)]
     pub connections: Vec<SavedConnection>,
 }
@@ -137,6 +142,7 @@ mod tests {
         ];
         let body = toml::to_string_pretty(&Config {
             theme: Some("claude-dark".into()),
+            dns: Some("cloudflare".into()),
             connections: conns.clone(),
         })
         .unwrap();

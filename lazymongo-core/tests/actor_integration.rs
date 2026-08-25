@@ -125,7 +125,12 @@ async fn browse_and_query_flow() {
     ensure_seeded(&uri).await;
 
     let (cmd, mut evt, _cancel) = actor::spawn(false);
-    cmd.send(Command::Connect { uri }).await.unwrap();
+    cmd.send(Command::Connect {
+        uri,
+        dns: lazymongo_core::types::DnsResolver::System,
+    })
+    .await
+    .unwrap();
     match recv(&mut evt).await {
         CoreEvent::Connected { server_version, .. } => {
             assert!(!server_version.is_empty())
@@ -362,7 +367,12 @@ async fn write_operations_roundtrip() {
     };
     ensure_seeded(&uri).await;
     let (cmd, mut evt, _cancel) = actor::spawn(false);
-    cmd.send(Command::Connect { uri }).await.unwrap();
+    cmd.send(Command::Connect {
+        uri,
+        dns: lazymongo_core::types::DnsResolver::System,
+    })
+    .await
+    .unwrap();
     assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
 
     let db = "lazymongo_write_test".to_string();
@@ -498,7 +508,12 @@ async fn read_only_mode_rejects_writes() {
     };
     ensure_seeded(&uri).await;
     let (cmd, mut evt, _cancel) = actor::spawn(true);
-    cmd.send(Command::Connect { uri }).await.unwrap();
+    cmd.send(Command::Connect {
+        uri,
+        dns: lazymongo_core::types::DnsResolver::System,
+    })
+    .await
+    .unwrap();
     assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
 
     cmd.send(Command::InsertOne {
@@ -538,7 +553,12 @@ async fn cancellation_and_write_stage_guard() {
     };
     ensure_seeded(&uri).await;
     let (cmd, mut evt, cancel) = actor::spawn(false);
-    cmd.send(Command::Connect { uri }).await.unwrap();
+    cmd.send(Command::Connect {
+        uri,
+        dns: lazymongo_core::types::DnsResolver::System,
+    })
+    .await
+    .unwrap();
     assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
 
     // Cancel generation 5 up-front: the find must abort, not return a batch.
@@ -600,7 +620,12 @@ async fn streaming_export_full_query() {
     };
     ensure_seeded(&uri).await;
     let (cmd, mut evt, _cancel) = actor::spawn(false);
-    cmd.send(Command::Connect { uri }).await.unwrap();
+    cmd.send(Command::Connect {
+        uri,
+        dns: lazymongo_core::types::DnsResolver::System,
+    })
+    .await
+    .unwrap();
     assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
 
     let dir = std::env::temp_dir();
@@ -659,7 +684,12 @@ async fn schema_sampling() {
     };
     ensure_seeded(&uri).await;
     let (cmd, mut evt, _cancel) = actor::spawn(false);
-    cmd.send(Command::Connect { uri }).await.unwrap();
+    cmd.send(Command::Connect {
+        uri,
+        dns: lazymongo_core::types::DnsResolver::System,
+    })
+    .await
+    .unwrap();
     assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
 
     cmd.send(Command::SampleSchema {

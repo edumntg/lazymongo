@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::display::{bson_to_compact, csv_escape};
 use crate::types::{
-    pipeline_writes, CollectionInfo, Command, CoreEvent, DatabaseInfo, ExportFormat, FindSpec,
-    IndexInfo, BATCH_SIZE, FIRST_BATCH_SIZE,
+    pipeline_writes, CollectionInfo, Command, CoreEvent, DatabaseInfo, DnsResolver, ExportFormat,
+    FindSpec, IndexInfo, BATCH_SIZE, FIRST_BATCH_SIZE,
 };
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
@@ -123,7 +123,7 @@ impl Actor {
             return;
         }
         match cmd {
-            Command::Connect { uri } => self.connect(uri).await,
+            Command::Connect { uri, dns } => self.connect(uri, dns).await,
             Command::SetReadOnly(ro) => self.read_only = ro,
             Command::ListDatabases => self.list_databases().await,
             Command::ListCollections { db } => self.list_collections(db).await,
@@ -190,9 +190,22 @@ impl Actor {
         self.client.is_some()
     }
 
-    async fn connect(&mut self, uri: String) {
+    async fn connect(&mut self, uri: String, dns: DnsResolver) {
         let result: anyhow::Result<(Client, String, u64)> = async {
-            let mut opts = ClientOptions::parse(&uri).await?;
+            let parse = ClientOptions::parse(&uri);
+            let parse = match dns {
+                DnsResolver::System => parse,
+                DnsResolver::Cloudflare => {
+                    parse.resolver_config(mongodb::options::ResolverConfig::cloudflare())
+                }
+                DnsResolver::Google => {
+                    parse.resolver_config(mongodb::options::ResolverConfig::google())
+                }
+                DnsResolver::Quad9 => {
+                    parse.resolver_config(mongodb::options::ResolverConfig::quad9())
+                }
+            };
+            let mut opts = parse.await?;
             opts.app_name = Some("lazymongo".into());
             opts.server_selection_timeout = Some(SERVER_SELECTION_TIMEOUT);
             opts.max_pool_size = Some(MAX_POOL_SIZE);

@@ -1373,7 +1373,11 @@ fn draw_ops_log(f: &mut Frame, area: Rect, log: &[String], scroll: &mut usize) {
             Style::new().fg(theme::text()),
         )));
     }
-    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+    // Wrap so long driver errors are fully readable.
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn draw_prompt(f: &mut Frame, area: Rect, prompt: &Prompt) {

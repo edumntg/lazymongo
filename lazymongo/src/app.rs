@@ -9,7 +9,8 @@ use lazymongo_core::actor;
 use lazymongo_core::bson::{Bson, Document};
 use lazymongo_core::query::{parse_doc, parse_filter, parse_optional_doc};
 use lazymongo_core::types::{
-    pipeline_writes, CollectionInfo, Command, CoreEvent, DatabaseInfo, FindSpec, BATCH_SIZE,
+    pipeline_writes, CollectionInfo, Command, CoreEvent, DatabaseInfo, DnsResolver, FindSpec,
+    BATCH_SIZE,
 };
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -271,8 +272,12 @@ pub struct App {
     cancel_tx: watch::Sender<u64>,
     /// Theme name persisted in config.toml (None = default).
     pub config_theme: Option<String>,
+    /// dns name persisted in config.toml (kept when rewriting the file).
+    pub config_dns: Option<String>,
     /// The real (unredacted) URI of the active connection, for `m` (mongosh).
     active_uri: Option<String>,
+    /// DNS resolver for +srv lookups (config `dns` / --dns).
+    pub dns: DnsResolver,
     /// Set by the `m` key; the run loop suspends the TUI and opens mongosh.
     pub pending_shell: bool,
     /// Set by Ctrl-E; the run loop suspends the TUI and opens $EDITOR.
@@ -317,7 +322,9 @@ impl App {
             next_req_id: 0,
             cancel_tx,
             config_theme: None,
+            config_dns: None,
             active_uri: None,
+            dns: DnsResolver::System,
             pending_shell: false,
             pending_external: None,
             pending_clear: false,
@@ -367,7 +374,18 @@ impl App {
                 self.explorer.loading = true;
                 self.send(Command::ListDatabases);
             }
-            CoreEvent::ConnectFailed(e) => self.conn = ConnState::Failed(e),
+            CoreEvent::ConnectFailed(e) => {
+                // Long driver errors get truncated in the status bar; keep
+                // the full text reachable via the ops log (L).
+                self.ops_log
+                    .push(format!("{}  connect failed: {e}", util::clock_utc()));
+                let hint = if e.contains("DNS") {
+                    " — SRV lookup failed; if it persists, set dns = \"cloudflare\" in config.toml (or --dns cloudflare)"
+                } else {
+                    ""
+                };
+                self.conn = ConnState::Failed(format!("{e}{hint} (L: full error)"));
+            }
             CoreEvent::Databases(dbs) => {
                 self.explorer.loading = false;
                 self.explorer.dbs = dbs
@@ -471,7 +489,9 @@ impl App {
             }
             CoreEvent::Error(e) => {
                 self.results.loading = false;
-                self.toast_err(e);
+                self.ops_log
+                    .push(format!("{}  error: {e}", util::clock_utc()));
+                self.toast_err(format!("{e} (L: full error)"));
             }
             CoreEvent::WriteDone {
                 namespace,
@@ -937,6 +957,7 @@ impl App {
         };
         let cfg = config::Config {
             theme: self.config_theme.clone(),
+            dns: self.config_dns.clone(),
             connections: items.clone(),
         };
         match config::save_config(&cfg) {
@@ -989,8 +1010,9 @@ impl App {
                 self.conn = ConnState::Connecting;
                 self.modal = Modal::None;
                 self.active_uri = Some(uri.clone());
+                let dns = self.dns;
                 self.send(Command::SetReadOnly(effective_ro));
-                self.send(Command::Connect { uri });
+                self.send(Command::Connect { uri, dns });
             }
         }
     }
@@ -1067,6 +1089,7 @@ impl App {
                 let name = items.remove(index).name;
                 let cfg = config::Config {
                     theme: self.config_theme.clone(),
+                    dns: self.config_dns.clone(),
                     connections: items.clone(),
                 };
                 match config::save_config(&cfg) {
@@ -2707,17 +2730,27 @@ pub fn redact_uri(uri: &str) -> String {
 }
 
 /// Main event loop: draw, then wait for the next input/core/tick event.
-pub async fn run(terminal: &mut term::Term, uri: Option<String>, read_only: bool) -> Result<()> {
+pub async fn run(
+    terminal: &mut term::Term,
+    uri: Option<String>,
+    read_only: bool,
+    dns: DnsResolver,
+) -> Result<()> {
     let (cmd_tx, mut core_rx, cancel_tx) = actor::spawn(read_only);
     let mut input_rx = event::input_channel();
     let mut app = App::new(String::new(), cmd_tx, cancel_tx, read_only);
-    app.config_theme = config::load_config().ok().and_then(|c| c.theme);
+    if let Ok(cfg) = config::load_config() {
+        app.config_theme = cfg.theme;
+        app.config_dns = cfg.dns;
+    }
+    app.dns = dns;
 
     match uri {
         Some(uri) => {
             app.uri_display = redact_uri(&uri);
             app.active_uri = Some(uri.clone());
-            app.send(Command::Connect { uri });
+            let dns = app.dns;
+            app.send(Command::Connect { uri, dns });
         }
         None => match config::load_config() {
             Err(e) => {
@@ -2736,7 +2769,8 @@ pub async fn run(terminal: &mut term::Term, uri: Option<String>, read_only: bool
                 let uri = "mongodb://localhost:27017".to_string();
                 app.uri_display = redact_uri(&uri);
                 app.active_uri = Some(uri.clone());
-                app.send(Command::Connect { uri });
+                let dns = app.dns;
+                app.send(Command::Connect { uri, dns });
             }
         },
     }
