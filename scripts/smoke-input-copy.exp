@@ -1,0 +1,51 @@
+#!/usr/bin/expect -f
+# Long query text scrolls horizontally in inputs; clicking a selected
+# scalar field copies its value.
+set timeout 15
+proc drain {secs} { set save $::timeout; set ::timeout $secs; expect -re {ZZZ_NEVER}; set ::timeout $save }
+proc gate {pattern {action {}} {total 15}} {
+    set deadline [expr {[clock seconds] + $total}]
+    while {[clock seconds] < $deadline} {
+        send "\x0c"
+        set ::timeout 1
+        expect {
+            -ex $pattern { set ::timeout 15; uplevel $action; return }
+            timeout {}
+            eof { send_user "\nFAIL: EOF waiting '$pattern'\n"; exit 1 }
+        }
+    }
+    send_user "\nFAIL: gate '$pattern' not reached\n"; exit 1
+}
+spawn ./target/debug/lazymongo mongodb://localhost:27099
+stty rows 40 columns 120 < $spawn_out(slave,name)
+gate "app_db"
+drain 1
+send "/users"
+gate "users"
+send "\r\r"
+gate "Results ─ app_db.users"
+drain 1
+# Long filter in the F editor: the tail (with a unique marker) must be
+# visible even though the text exceeds the field width
+send "F"
+gate "projection"
+send "{ name: 'User 1', status: 'active', age: { \$gte: 18, \$lte: 40 }, email: 'ENDMARKER' }"
+gate "ENDMARKER" { send_user "\n=== LONG INPUT TAIL VISIBLE OK ===\n" }
+# scrolled view shows the left ellipsis marker
+gate "…" { send_user "\n=== SCROLL MARKER OK ===\n" }
+send "\x1b"
+drain 0.5
+# Click-to-copy: expand the first doc, click a scalar line twice
+send "g"
+send "\r"
+gate "email"
+drain 0.5
+# first doc expanded: row 3 = doc header, row 5 = name field (scalar)
+send "\x1b\[<0;40;6M\x1b\[<3;40;6m"
+drain 0.3
+send "\x1b\[<0;40;6M\x1b\[<3;40;6m"
+gate "copied: " { send_user "\n=== CLICK COPY OK ===\n" }
+drain 0.5
+send "q"
+expect eof
+send_user "\n=== INPUT/COPY CLEAN EXIT ===\n"

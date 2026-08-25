@@ -17,7 +17,29 @@ pub struct RLine {
     pub doc_idx: usize,
     /// Fold path this line toggles ("" = whole document). None = not foldable.
     pub fold_path: Option<String>,
+    /// Plain, untruncated value for scalar lines — what a click-to-copy
+    /// puts on the clipboard.
+    pub copy_text: Option<String>,
     pub line: Line<'static>,
+}
+
+/// The paste-friendly plain form of a scalar (full string, oid hex, rfc3339
+/// date, bare number/bool) — unlike the display form, never truncated.
+pub fn copy_value(v: &Bson) -> String {
+    match v {
+        Bson::String(s) => s.clone(),
+        Bson::ObjectId(oid) => oid.to_string(),
+        Bson::DateTime(dt) => dt
+            .try_to_rfc3339_string()
+            .unwrap_or_else(|_| format!("{dt}")),
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Double(n) => n.to_string(),
+        Bson::Decimal128(n) => n.to_string(),
+        Bson::Boolean(b) => b.to_string(),
+        Bson::Null => "null".into(),
+        other => format!("{other}"),
+    }
 }
 
 const INDENT: &str = "  ";
@@ -116,6 +138,7 @@ pub fn doc_lines(
         out.push(RLine {
             doc_idx,
             fold_path: Some(String::new()),
+            copy_text: None,
             line: Line::from(spans),
         });
         return out;
@@ -124,6 +147,7 @@ pub fn doc_lines(
     out.push(RLine {
         doc_idx,
         fold_path: Some(String::new()),
+        copy_text: None,
         line: Line::from(vec![
             Span::styled("▾ ", marker_style()),
             header_num,
@@ -136,6 +160,7 @@ pub fn doc_lines(
     out.push(RLine {
         doc_idx,
         fold_path: None,
+        copy_text: None,
         line: Line::from(Span::styled("}", punct_style())),
     });
     out
@@ -158,6 +183,7 @@ fn render_entry(
                 out.push(RLine {
                     doc_idx,
                     fold_path: Some(path),
+                    copy_text: None,
                     line: Line::from(vec![
                         Span::raw(pad),
                         Span::styled("▸ ", marker_style()),
@@ -170,6 +196,7 @@ fn render_entry(
                 out.push(RLine {
                     doc_idx,
                     fold_path: Some(path.clone()),
+                    copy_text: None,
                     line: Line::from(vec![
                         Span::raw(pad.clone()),
                         Span::styled("▾ ", marker_style()),
@@ -183,6 +210,7 @@ fn render_entry(
                 out.push(RLine {
                     doc_idx,
                     fold_path: None,
+                    copy_text: None,
                     line: Line::from(vec![Span::raw(pad), Span::styled("}", punct_style())]),
                 });
             }
@@ -192,6 +220,7 @@ fn render_entry(
                 out.push(RLine {
                     doc_idx,
                     fold_path: Some(path),
+                    copy_text: None,
                     line: Line::from(vec![
                         Span::raw(pad),
                         Span::styled("▸ ", marker_style()),
@@ -204,6 +233,7 @@ fn render_entry(
                 out.push(RLine {
                     doc_idx,
                     fold_path: Some(path.clone()),
+                    copy_text: None,
                     line: Line::from(vec![
                         Span::raw(pad.clone()),
                         Span::styled("▾ ", marker_style()),
@@ -225,6 +255,7 @@ fn render_entry(
                 out.push(RLine {
                     doc_idx,
                     fold_path: None,
+                    copy_text: None,
                     line: Line::from(vec![Span::raw(pad), Span::styled("]", punct_style())]),
                 });
             }
@@ -233,6 +264,7 @@ fn render_entry(
             out.push(RLine {
                 doc_idx,
                 fold_path: None,
+                copy_text: Some(copy_value(scalar)),
                 line: Line::from(vec![
                     Span::raw(format!("{pad}  ")), // align with foldable markers
                     Span::styled(key.to_string(), key_style()),

@@ -79,6 +79,8 @@ pub struct DocView {
     pub scroll: usize,
     /// Warning banner, e.g. COLLSCAN flag on explain output.
     pub warn: Option<String>,
+    /// Rendered content rect (mouse hit-testing), set at draw time.
+    pub inner: ratatui::layout::Rect,
 }
 
 impl DocView {
@@ -91,6 +93,7 @@ impl DocView {
             cursor: 0,
             scroll: 0,
             warn,
+            inner: ratatui::layout::Rect::default(),
         };
         v.rebuild();
         v

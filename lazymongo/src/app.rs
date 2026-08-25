@@ -2164,6 +2164,20 @@ impl App {
         self.send(Command::Explain { db, coll, spec });
     }
 
+    /// Put a single field value on the clipboard (click-to-copy).
+    fn copy_field_value(&mut self, value: &str) {
+        match util::clipboard_copy(value) {
+            Ok(()) => {
+                let mut shown: String = value.chars().take(40).collect();
+                if value.chars().count() > 40 {
+                    shown.push('…');
+                }
+                self.toast_info(format!("copied: {shown}"));
+            }
+            Err(e) => self.toast_err(e),
+        }
+    }
+
     fn copy_current_doc(&mut self) {
         let Some(idx) = self.current_doc_idx() else {
             return;
@@ -2494,6 +2508,21 @@ impl App {
         if self.modal.is_open() {
             match (&mut self.modal, m.kind) {
                 (Modal::Help, MouseEventKind::Down(_)) => self.modal = Modal::None,
+                (Modal::DocView(view), MouseEventKind::Down(MouseButton::Left))
+                    if view.inner.contains(pos) =>
+                {
+                    let line = (m.row.saturating_sub(view.inner.y)) as usize + view.scroll;
+                    if line < view.lines.len() {
+                        if view.cursor == line {
+                            match view.lines[line].copy_text.clone() {
+                                Some(value) => self.copy_field_value(&value),
+                                None => view.toggle_fold_at_cursor(),
+                            }
+                        } else {
+                            view.cursor = line;
+                        }
+                    }
+                }
                 (Modal::DocView(view), MouseEventKind::ScrollDown) => {
                     view.cursor = (view.cursor + 3).min(view.lines.len().saturating_sub(1));
                 }
@@ -2523,7 +2552,13 @@ impl App {
                                 + self.results.scroll;
                             if line < self.results.lines.len() {
                                 if self.results.cursor == line {
-                                    self.toggle_fold_at_cursor();
+                                    // Second click: scalar fields copy their
+                                    // value; foldables toggle.
+                                    let copy = self.results.lines[line].copy_text.clone();
+                                    match copy {
+                                        Some(value) => self.copy_field_value(&value),
+                                        None => self.toggle_fold_at_cursor(),
+                                    }
                                 } else {
                                     self.results.cursor = line;
                                 }

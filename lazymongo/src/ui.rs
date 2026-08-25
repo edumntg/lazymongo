@@ -521,28 +521,12 @@ fn draw_query(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let mut spans = vec![Span::styled("filter> ", Style::new().fg(theme::warn()))];
-    if focused {
-        // Render a visible cursor by splitting the input at the cursor column.
-        let chars: Vec<char> = app.query.input.chars().collect();
-        let before: String = chars[..app.query.cursor].iter().collect();
-        let at: String = chars
-            .get(app.query.cursor)
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| " ".into());
-        let after: String = if app.query.cursor < chars.len() {
-            chars[app.query.cursor + 1..].iter().collect()
-        } else {
-            String::new()
-        };
-        spans.push(Span::raw(before));
-        spans.push(Span::styled(
-            at,
-            Style::new().add_modifier(Modifier::REVERSED),
-        ));
-        spans.push(Span::raw(after));
-    } else {
-        spans.push(Span::raw(app.query.input.clone()));
-    }
+    spans.extend(crate::input::input_spans(
+        &app.query.input,
+        app.query.cursor,
+        focused,
+        inner.width.saturating_sub(8),
+    ));
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
@@ -762,7 +746,7 @@ fn draw_palette(f: &mut Frame, area: Rect, palette: &Palette) {
 
     let mut lines: Vec<Line> = Vec::new();
     let mut prompt = vec![Span::styled(" > ", Style::new().fg(theme::marker()))];
-    prompt.extend(palette.input.spans(true));
+    prompt.extend(palette.input.spans(true, inner.width.saturating_sub(4)));
     lines.push(Line::from(prompt));
     lines.push(Line::raw(""));
 
@@ -861,7 +845,7 @@ fn draw_conn_form(f: &mut Frame, area: Rect, form: &ConnForm) {
             format!(" {:<10}", CONN_FIELD_LABELS[i]),
             label_style,
         )];
-        spans.extend(field.spans(focused));
+        spans.extend(field.spans(focused, inner.width.saturating_sub(13)));
         lines.push(Line::from(spans));
         lines.push(Line::raw(""));
     }
@@ -1256,7 +1240,7 @@ fn draw_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
     lines.push(Line::raw(""));
     if confirm.typed_required.is_some() {
         let mut spans = vec![Span::styled(" > ", Style::new().fg(theme::warn()))];
-        spans.extend(confirm.typed.spans(true));
+        spans.extend(confirm.typed.spans(true, inner.width.saturating_sub(4)));
         lines.push(Line::from(spans));
         let ok = confirm.typed_ok();
         lines.push(Line::from(Span::styled(
@@ -1390,7 +1374,7 @@ fn draw_prompt(f: &mut Frame, area: Rect, prompt: &Prompt) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
     let mut spans = vec![Span::styled(" > ", Style::new().fg(theme::warn()))];
-    spans.extend(prompt.input.spans(true));
+    spans.extend(prompt.input.spans(true, inner.width.saturating_sub(4)));
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
@@ -1418,7 +1402,7 @@ fn draw_query_editor(f: &mut Frame, area: Rect, editor: &QueryEditor) {
             format!(" {:<11}", QUERY_FIELD_LABELS[i]),
             label_style,
         )];
-        spans.extend(field.spans(focused));
+        spans.extend(field.spans(focused, inner.width.saturating_sub(12)));
         lines.push(Line::from(spans));
         lines.push(Line::raw(""));
     }
@@ -1457,6 +1441,7 @@ fn draw_doc_view(f: &mut Frame, area: Rect, view: &mut DocView) {
         inner.y += 1;
         inner.height = inner.height.saturating_sub(1);
     }
+    view.inner = inner;
 
     let height = inner.height as usize;
     let len = view.lines.len();
@@ -1565,6 +1550,15 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
             key("↵ · ↑↓"),
             txt("run filter (mongosh syntax) · history"),
         ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            " Mouse: click selects · click again copies the field (or folds).",
+            Style::new().fg(theme::dim()),
+        )),
+        Line::from(Span::styled(
+            " Native text selection: hold Option/Alt (or Shift) while dragging.",
+            Style::new().fg(theme::dim()),
+        )),
     ];
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
