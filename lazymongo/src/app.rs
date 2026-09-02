@@ -709,6 +709,18 @@ impl App {
                             Err(e) => self.toast_err(e),
                         }
                     }
+                    KeyCode::Char('Y') => {
+                        let copied = view
+                            .lines
+                            .get(view.cursor)
+                            .and_then(|l| node_json(&view.doc, l));
+                        if let Some((text, what)) = copied {
+                            match util::clipboard_copy(&text) {
+                                Ok(()) => self.toast_info(format!("{what} copied as JSON")),
+                                Err(e) => self.toast_err(e),
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1294,6 +1306,10 @@ impl App {
             ("doc: open full-screen (o)".into(), AppAction::DocView),
             ("doc: copy to clipboard (y)".into(), AppAction::CopyDoc),
             (
+                "doc: copy node under cursor as json (Y)".into(),
+                AppAction::CopyNode,
+            ),
+            (
                 "export loaded docs as json/csv (E)".into(),
                 AppAction::Export,
             ),
@@ -1319,7 +1335,10 @@ impl App {
                 "connections: manage / switch (C)".into(),
                 AppAction::Connections,
             ),
-            ("refresh (r)".into(), AppAction::Refresh),
+            (
+                "refresh: reload collection / sidebar (r)".into(),
+                AppAction::Refresh,
+            ),
             ("help / keybindings (?)".into(), AppAction::Help),
             ("quit (q)".into(), AppAction::Quit),
         ];
@@ -1382,6 +1401,7 @@ impl App {
             AppAction::Explain => self.explain_current(),
             AppAction::DocView => self.open_doc_view(),
             AppAction::CopyDoc => self.copy_current_doc(),
+            AppAction::CopyNode => self.copy_current_node(),
             AppAction::Export => self.export_results(),
             AppAction::EditDoc => self.edit_current_doc(),
             AppAction::InsertDoc => self.insert_doc_flow(),
@@ -1422,23 +1442,27 @@ impl App {
         };
     }
 
+    /// r: reload the open collection from the server (keeps the active
+    /// filter/spec). With the explorer focused — or nothing open — it also
+    /// reloads the database & collection lists.
     fn refresh(&mut self) {
-        match self.focus {
-            Pane::Explorer => {
-                self.explorer.loading = true;
-                self.send(Command::ListDatabases);
-                let expanded: Vec<String> = self
-                    .explorer
-                    .dbs
-                    .iter()
-                    .filter(|n| n.expanded)
-                    .map(|n| n.info.name.clone())
-                    .collect();
-                for db in expanded {
-                    self.send(Command::ListCollections { db });
-                }
+        if let Some((db, coll)) = self.results.target.clone() {
+            self.toast_info(format!("refreshing {db}.{coll}…"));
+            self.rerun_find();
+        }
+        if self.focus == Pane::Explorer || self.results.target.is_none() {
+            self.explorer.loading = true;
+            self.send(Command::ListDatabases);
+            let expanded: Vec<String> = self
+                .explorer
+                .dbs
+                .iter()
+                .filter(|n| n.expanded)
+                .map(|n| n.info.name.clone())
+                .collect();
+            for db in expanded {
+                self.send(Command::ListCollections { db });
             }
-            Pane::Results | Pane::Query => self.rerun_find(),
         }
     }
 
@@ -1682,6 +1706,7 @@ impl App {
             KeyCode::Char('x') => return self.explain_current(),
             KeyCode::Char('o') => return self.open_doc_view(),
             KeyCode::Char('y') => return self.copy_current_doc(),
+            KeyCode::Char('Y') => return self.copy_current_node(),
             KeyCode::Char('E') => return self.export_results(),
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return self.edit_current_doc_external()
@@ -1991,6 +2016,18 @@ impl App {
                         }
                     }
                 }
+                KeyCode::Char('Y') => {
+                    let copied = agg
+                        .lines
+                        .get(agg.cursor)
+                        .and_then(|l| agg.docs.get(l.doc_idx).and_then(|d| node_json(d, l)));
+                    if let Some((text, what)) = copied {
+                        match util::clipboard_copy(&text) {
+                            Ok(()) => self.toast_info(format!("{what} copied as JSON")),
+                            Err(e) => self.toast_err(e),
+                        }
+                    }
+                }
                 _ => {}
             },
         }
@@ -2185,6 +2222,25 @@ impl App {
         let text = util::doc_to_pretty(&self.results.docs[idx]);
         match util::clipboard_copy(&text) {
             Ok(()) => self.toast_info("document copied to clipboard".into()),
+            Err(e) => self.toast_err(e),
+        }
+    }
+
+    /// Copy the node under the cursor as JSON (Y / right-click): the whole
+    /// entry on its root line, the subtree on an object/array line, the
+    /// value on a scalar line. Table view falls back to the whole document.
+    fn copy_current_node(&mut self) {
+        if self.view == ViewMode::Table {
+            return self.copy_current_doc();
+        }
+        let copied = self
+            .results
+            .lines
+            .get(self.results.cursor)
+            .and_then(|l| node_json(&self.results.docs[l.doc_idx], l));
+        let Some((text, what)) = copied else { return };
+        match util::clipboard_copy(&text) {
+            Ok(()) => self.toast_info(format!("{what} copied as JSON")),
             Err(e) => self.toast_err(e),
         }
     }
@@ -2523,6 +2579,20 @@ impl App {
                         }
                     }
                 }
+                // Right-click: copy the clicked node as JSON (never folds).
+                (Modal::DocView(view), MouseEventKind::Down(MouseButton::Right))
+                    if view.inner.contains(pos) =>
+                {
+                    let line = (m.row.saturating_sub(view.inner.y)) as usize + view.scroll;
+                    let copied = view.lines.get(line).and_then(|l| node_json(&view.doc, l));
+                    if let Some((text, what)) = copied {
+                        view.cursor = line;
+                        match util::clipboard_copy(&text) {
+                            Ok(()) => self.toast_info(format!("{what} copied as JSON")),
+                            Err(e) => self.toast_err(e),
+                        }
+                    }
+                }
                 (Modal::DocView(view), MouseEventKind::ScrollDown) => {
                     view.cursor = (view.cursor + 3).min(view.lines.len().saturating_sub(1));
                 }
@@ -2568,6 +2638,19 @@ impl App {
                     }
                 } else if self.query_area.contains(pos) {
                     self.focus = Pane::Query;
+                }
+            }
+            // Right-click on a result copies that node as JSON (unlike a
+            // second left click, it never folds/unfolds).
+            MouseEventKind::Down(MouseButton::Right)
+                if self.results_area.contains(pos) && self.view == ViewMode::Json =>
+            {
+                self.focus = Pane::Results;
+                let line =
+                    (m.row.saturating_sub(self.results_area.y + 1)) as usize + self.results.scroll;
+                if line < self.results.lines.len() {
+                    self.results.cursor = line;
+                    self.copy_current_node();
                 }
             }
             MouseEventKind::ScrollDown => self.scroll_under_mouse(pos, 3),
@@ -2650,6 +2733,25 @@ fn build_spec(
         limit: parse_num(limit, "limit")?,
         skip: parse_num(skip, "skip")?.map(|n| n.max(0) as u64),
     })
+}
+
+/// JSON text + short label ("document" / "\"field\"" / "value") for the node
+/// a rendered line points at. None only when the path no longer resolves.
+fn node_json(doc: &Document, rline: &RLine) -> Option<(String, String)> {
+    match (&rline.fold_path, &rline.copy_text) {
+        (Some(path), _) => {
+            let node = util::bson_at_path(doc, path)?;
+            let what = if path.is_empty() {
+                "document".to_string()
+            } else {
+                format!("\"{}\"", path.rsplit('.').next().unwrap_or(path))
+            };
+            Some((util::bson_to_pretty(&node), what))
+        }
+        (None, Some(value)) => Some((value.clone(), "value".into())),
+        // Closing brace/bracket lines: treat as the whole entry.
+        (None, None) => Some((util::doc_to_pretty(doc), "document".into())),
+    }
 }
 
 /// Concatenated plain text of a rendered line (for search).

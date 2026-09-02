@@ -136,8 +136,10 @@ read_only = true             # RO badge + all writes blocked
 | `v` · `o` · `x` | Table view · doc view · explain |
 | `e` `i` `d` `D` `U` | Edit · insert · delete · bulk delete · bulk update |
 | `a` · `I` · `L` · `m` | Aggregations · indexes · ops log · mongosh |
+| `y` / `Y` | Copy document · copy node under cursor as JSON (also right-click) |
+| `r` | Refresh: reload the open collection (and sidebar in explorer) |
 | `Ctrl-P` / `:` | Command palette |
-| `C` · `r` · `?` · `q` | Connections · refresh · help · quit |
+| `C` · `?` · `q` | Connections · help · quit |
 
 ## How it works
 

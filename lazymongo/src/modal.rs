@@ -303,6 +303,7 @@ pub enum AppAction {
     Explain,
     DocView,
     CopyDoc,
+    CopyNode,
     Export,
     EditDoc,
     InsertDoc,

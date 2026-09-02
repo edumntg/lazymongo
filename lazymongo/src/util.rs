@@ -14,6 +14,29 @@ pub fn doc_to_pretty(doc: &Document) -> String {
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{doc:?}"))
 }
 
+/// Pretty relaxed Extended JSON for any BSON node (subdoc, array, scalar).
+pub fn bson_to_pretty(v: &Bson) -> String {
+    let value = v.clone().into_relaxed_extjson();
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{v:?}"))
+}
+
+/// Resolve a fold path ("a.b.0"; "" = whole doc) to the BSON node it names.
+/// Keys containing '.' are not addressable this way and return None.
+pub fn bson_at_path(doc: &Document, path: &str) -> Option<Bson> {
+    if path.is_empty() {
+        return Some(Bson::Document(doc.clone()));
+    }
+    let mut cur = Bson::Document(doc.clone());
+    for seg in path.split('.') {
+        cur = match cur {
+            Bson::Document(d) => d.get(seg)?.clone(),
+            Bson::Array(items) => items.get(seg.parse::<usize>().ok()?)?.clone(),
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
 pub use lazymongo_core::display::bson_to_compact;
 
 /// Copy text to the system clipboard by shelling out (no heavy deps).
@@ -60,6 +83,32 @@ fn timestamp() -> u64 {
 pub fn clock_utc() -> String {
     let s = timestamp();
     format!("{:02}:{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60, s % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lazymongo_core::bson::doc;
+
+    #[test]
+    fn bson_at_path_walks_docs_and_arrays() {
+        let d = doc! { "a": { "b": [ { "c": 7 }, 2 ] }, "x": 1 };
+        assert_eq!(bson_at_path(&d, ""), Some(Bson::Document(d.clone())));
+        assert_eq!(bson_at_path(&d, "a.b.0.c"), Some(Bson::Int32(7)));
+        assert_eq!(bson_at_path(&d, "a.b.1"), Some(Bson::Int32(2)));
+        assert_eq!(bson_at_path(&d, "a.b.9"), None);
+        assert_eq!(bson_at_path(&d, "a.nope"), None);
+        assert_eq!(bson_at_path(&d, "x.deeper"), None);
+    }
+
+    #[test]
+    fn bson_to_pretty_renders_any_node() {
+        let d = doc! { "tags": ["a", "b"] };
+        let node = bson_at_path(&d, "tags").unwrap();
+        let json = bson_to_pretty(&node);
+        assert!(json.contains("\"a\""), "{json}");
+        assert!(json.trim_start().starts_with('['), "{json}");
+    }
 }
 
 /// Recursively search an explain plan for a COLLSCAN stage (FR-15).

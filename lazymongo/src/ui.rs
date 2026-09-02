@@ -536,7 +536,7 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
             Modal::DocView(_) => &[
                 ("↑↓/jk", "move"),
                 ("↵", "fold"),
-                ("y", "copy"),
+                ("y/Y", "copy doc/node"),
                 ("esc", "close"),
             ],
             Modal::QueryEditor(_) => &[("tab/↑↓", "field"), ("↵", "run"), ("esc", "cancel")],
@@ -606,13 +606,14 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
                 ViewMode::Json => &[
                     ("↑↓/jk", "move"),
                     ("↵", "fold"),
+                    ("r", "refresh"),
+                    ("y/Y", "copy"),
                     ("v", "table"),
                     ("o", "doc"),
                     ("F", "query"),
                     ("x", "explain"),
                     ("e", "edit"),
                     ("i", "insert"),
-                    ("c", "duplicate"),
                     ("d", "delete"),
                     ("?", "help"),
                 ],
@@ -1464,9 +1465,6 @@ fn draw_doc_view(f: &mut Frame, area: Rect, view: &mut DocView) {
 }
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    let popup = centered(area, 66, 30);
-    f.render_widget(Clear, popup);
-
     let key = |k: &str| Span::styled(format!("  {k:<14}"), Style::new().fg(theme::key()));
     let txt = |t: &str| Span::styled(t.to_string(), Style::new().fg(theme::text()));
     let head = |t: &str| {
@@ -1481,7 +1479,10 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         head("Global"),
         Line::from(vec![key("q / ctrl-c"), txt("quit")]),
         Line::from(vec![key("tab / 1 2 3"), txt("switch pane")]),
-        Line::from(vec![key("r"), txt("refresh current pane")]),
+        Line::from(vec![
+            key("r"),
+            txt("refresh: reload collection (+ sidebar)"),
+        ]),
         Line::from(vec![key("C"), txt("connection manager (add/edit/switch)")]),
         Line::from(vec![key("^p / :"), txt("command palette (incl. themes)")]),
         Line::from(vec![key("^t"), txt("open collection by name (fuzzy)")]),
@@ -1500,7 +1501,8 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![key("x"), txt("explain query plan")]),
         Line::from(vec![key("o"), txt("open document full-screen")]),
-        Line::from(vec![key("y"), txt("copy document to clipboard")]),
+        Line::from(vec![key("y"), txt("copy whole document as JSON")]),
+        Line::from(vec![key("Y"), txt("copy node under cursor as JSON")]),
         Line::from(vec![
             key("E"),
             txt("export FULL query to file (json / csv, streamed)"),
@@ -1556,10 +1558,17 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
             Style::new().fg(theme::dim()),
         )),
         Line::from(Span::styled(
+            " Right-click copies the clicked node (doc/object/value) as JSON.",
+            Style::new().fg(theme::dim()),
+        )),
+        Line::from(Span::styled(
             " Native text selection: hold Option/Alt (or Shift) while dragging.",
             Style::new().fg(theme::dim()),
         )),
     ];
+    // Size the popup to the content so no rows are clipped off.
+    let popup = centered(area, 66, lines.len() as u16 + 2);
+    f.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme::accent()))
