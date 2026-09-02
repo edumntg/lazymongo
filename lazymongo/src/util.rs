@@ -85,6 +85,31 @@ pub fn clock_utc() -> String {
     format!("{:02}:{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60, s % 60)
 }
 
+/// Recursively search an explain plan for a COLLSCAN stage (FR-15).
+pub fn has_collscan(doc: &Document) -> bool {
+    for (k, v) in doc.iter() {
+        match v {
+            Bson::String(s) if k == "stage" && s == "COLLSCAN" => return true,
+            Bson::Document(d) => {
+                if has_collscan(d) {
+                    return true;
+                }
+            }
+            Bson::Array(items) => {
+                for item in items {
+                    if let Bson::Document(d) = item {
+                        if has_collscan(d) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,29 +134,4 @@ mod tests {
         assert!(json.contains("\"a\""), "{json}");
         assert!(json.trim_start().starts_with('['), "{json}");
     }
-}
-
-/// Recursively search an explain plan for a COLLSCAN stage (FR-15).
-pub fn has_collscan(doc: &Document) -> bool {
-    for (k, v) in doc.iter() {
-        match v {
-            Bson::String(s) if k == "stage" && s == "COLLSCAN" => return true,
-            Bson::Document(d) => {
-                if has_collscan(d) {
-                    return true;
-                }
-            }
-            Bson::Array(items) => {
-                for item in items {
-                    if let Bson::Document(d) = item {
-                        if has_collscan(d) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
