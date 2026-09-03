@@ -555,6 +555,7 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
             Modal::Indexes(_) => &[
                 ("↑↓", "move"),
                 ("c", "create"),
+                ("e", "edit"),
                 ("d", "drop"),
                 ("r", "refresh"),
                 ("esc", "close"),
@@ -1294,7 +1295,7 @@ fn draw_indexes(f: &mut Frame, area: Rect, view: &IndexesView, spin: &str) {
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme::accent()))
         .title(format!(
-            " Indexes ─ {}.{} ─ c create · d drop · r refresh · esc close ",
+            " Indexes ─ {}.{} ─ c create · e edit · d drop · r refresh · esc close ",
             view.db, view.coll
         ));
     let inner = block.inner(popup);
@@ -1312,14 +1313,13 @@ fn draw_indexes(f: &mut Frame, area: Rect, view: &IndexesView, spin: &str) {
         ))),
         Some(list) => {
             for (i, idx) in list.iter().enumerate() {
-                let unique = if idx.unique { "  [unique]" } else { "" };
                 let keys_json = lazymongo_core::bson::Bson::Document(idx.keys.clone())
                     .into_relaxed_extjson()
                     .to_string();
                 let mut line = Line::from(vec![
                     Span::styled(format!(" {:<24}", idx.name), Style::new().fg(theme::key())),
                     Span::styled(keys_json, Style::new().fg(theme::text())),
-                    Span::styled(unique, Style::new().fg(theme::warn())),
+                    Span::styled(index_badges(idx), Style::new().fg(theme::warn())),
                 ]);
                 if i == view.selected {
                     line.style = Style::new().bg(theme::sel_bg());
@@ -1329,6 +1329,37 @@ fn draw_indexes(f: &mut Frame, area: Rect, view: &IndexesView, spin: &str) {
         }
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Property badges shown after an index's key spec: [unique] [sparse]
+/// [hidden] [ttl Ns] [partial] [text].
+fn index_badges(idx: &lazymongo_core::types::IndexInfo) -> String {
+    use lazymongo_core::bson::Bson;
+    let mut out = String::new();
+    if idx.unique {
+        out.push_str("  [unique]");
+    }
+    for flag in ["sparse", "hidden"] {
+        if idx.options.get_bool(flag).unwrap_or(false) {
+            out.push_str(&format!("  [{flag}]"));
+        }
+    }
+    let ttl = match idx.options.get("expireAfterSeconds") {
+        Some(Bson::Int32(n)) => Some(i64::from(*n)),
+        Some(Bson::Int64(n)) => Some(*n),
+        Some(Bson::Double(d)) => Some(*d as i64),
+        _ => None,
+    };
+    if let Some(secs) = ttl {
+        out.push_str(&format!("  [ttl {secs}s]"));
+    }
+    if idx.options.contains_key("partialFilterExpression") {
+        out.push_str("  [partial]");
+    }
+    if idx.keys.values().any(|v| v == &Bson::from("text")) {
+        out.push_str("  [text]");
+    }
+    out
 }
 
 fn draw_ops_log(f: &mut Frame, area: Rect, log: &[String], scroll: &mut usize) {

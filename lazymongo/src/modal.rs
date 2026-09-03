@@ -136,6 +136,7 @@ pub enum PendingAction {
     },
     CreateIndex {
         keys: Document,
+        options: Document,
     },
     DropIndex {
         name: String,
@@ -179,8 +180,9 @@ pub enum EditorPurpose {
     InsertDoc,
     /// Update document for update-many over the current filter (FR-30).
     UpdateMany { filter: Document },
-    /// Key spec for a new index (FR-31).
-    CreateIndexKeys,
+    /// Spec for a new index (FR-31): either a bare key spec like
+    /// `{ email: 1 }` or the full `{ "keys": …, "options": … }` form.
+    CreateIndexSpec,
 }
 
 /// Multi-line JSON editor modal (Ctrl-S submits).

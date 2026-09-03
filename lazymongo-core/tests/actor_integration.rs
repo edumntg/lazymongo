@@ -448,6 +448,7 @@ async fn write_operations_roundtrip() {
         db: db.clone(),
         coll: coll.clone(),
         keys: doc! { "n": 1 },
+        options: doc! {},
     })
     .await
     .unwrap();

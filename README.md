@@ -59,6 +59,7 @@ cargo install --path lazymongo            # installs to ~/.cargo/bin
 lazymongo "mongodb://localhost:27017"     # any mongodb:// or mongodb+srv:// URI
 lazymongo --readonly "mongodb+srv://…"    # hard-block all writes (great for prod)
 lazymongo --theme claude-dark             # pick a theme
+lazymongo --dns cloudflare "mongodb+srv://…"  # bypass local DNS for +srv lookups
 lazymongo                                 # saved-connections picker (see Connections)
 ```
 
@@ -81,19 +82,45 @@ and through the fuzzy **command palette** (`Ctrl-P` or `:`).
 - Structured query editor (`F`): filter / projection / sort / **limit** / **skip**
 - `x` **explain** with executionStats and a COLLSCAN warning banner
 - `/` search the loaded results (live jump, `n`/`N`) · `Esc` cancels a running query
-- `o` full-screen document view · `y` copy to clipboard · `E` export JSON/CSV
+- `o` full-screen document view · `y`/`Y` copy document / node to clipboard ·
+  `E` **streaming export** of the full query result to JSON/CSV (not just the loaded window)
+- `S` **schema view**: sampled field presence and types for the collection
+- `Ctrl-T` fuzzy **namespace switcher** — jump to any `db.collection` by name
 
 ### Write operations — always confirmed, always logged
-- `e` edit (JSON editor with a field-level diff before `replaceOne`) · `i` insert
+- `e` edit (JSON editor with a field-level diff before `replaceOne`) — or `Ctrl-E`
+  to edit in your **`$EDITOR`** · `i` insert · `c` duplicate the selected document
 - `d` delete one (with preview) · `D` **bulk delete** by filter · `U` **bulk update**
   by filter — both run a `countDocuments` **dry run first**; delete-many requires
   typing the count
-- `I` indexes: list, create, drop · `N`/`X` create / drop collection (type its name)
+- `N`/`X` create / drop collection (type its name to confirm the drop)
 - `L` session operations log · `--readonly` blocks writes in the UI **and** at the I/O layer
+
+### Index manager (`I`)
+- Lists every index with its key spec and property badges:
+  `[unique]` `[sparse]` `[hidden]` `[ttl 3600s]` `[partial]` `[text]`
+- `c` **create** opens a JSON editor for the full server spec — keys **and**
+  options (`name`, `unique`, `expireAfterSeconds`, `partialFilterExpression`,
+  `sparse`, collation, weights, …):
+
+  ```json5
+  {
+    keys: { email: 1 },
+    options: { name: "email_unique", unique: true }
+  }
+  ```
+
+  A bare key spec like `{ email: 1, age: -1 }` still works. Options are
+  validated against the driver before anything reaches the server.
+- `e` **edit** pre-fills the editor from the selected index (indexes are
+  immutable server-side, so it saves as a new index — rename it or drop the old one)
+- `d` drop (confirmed; `_id_` is protected) · everything read-only-aware
 
 ### Aggregations (`a`)
 - Full-screen JSON5 pipeline editor with **stage-by-stage preview**: select any
   stage and run the pipeline truncated to it (`Enter`), or `Ctrl-R` for all of it
+- **Charts**: `g` toggles a chart of the preview results, `t` cycles
+  auto / bars / line / scatter (dates and numeric `_id`s plot as x/y series)
 - Pipelines persist per collection across sessions
 - `$out`/`$merge` are refused in the preview — a preview must never write
 
@@ -102,6 +129,10 @@ and through the fuzzy **command palette** (`Ctrl-P` or `:`).
 - **`m` drops you into mongosh** on the current connection; exit to return
 - **6 themes**: `dark` · `light` · `claude-dark` · `claude-light` · `termius` ·
   `high-contrast` — switch live from the palette (persists), `--theme`, or config
+- Click a field to select it, **click again to copy its value**; right-click
+  copies any node (document / object / scalar) as JSON
+- `--dns cloudflare|google|quad9` for `mongodb+srv://` when local or VPN DNS
+  mangles SRV/TXT lookups (also a `dns` key in config.toml)
 - Credentials always redacted on screen; live server version + ping in the status bar
 - Panic-safe terminal restore; stale results dropped via generation tokens
 
@@ -133,12 +164,14 @@ read_only = true             # RO badge + all writes blocked
 | `Enter` | Expand db · open collection · fold/unfold |
 | `3` + type + `Enter` | Run a filter |
 | `F` | Query editor (projection / sort / limit / skip) |
-| `v` · `o` · `x` | Table view · doc view · explain |
-| `e` `i` `d` `D` `U` | Edit · insert · delete · bulk delete · bulk update |
-| `a` · `I` · `L` · `m` | Aggregations · indexes · ops log · mongosh |
+| `v` · `o` · `x` · `S` | Table view · doc view · explain · schema |
+| `e` `i` `c` `d` `D` `U` | Edit · insert · duplicate · delete · bulk delete · bulk update |
+| `a` · `I` · `L` · `m` | Aggregations · index manager · ops log · mongosh |
 | `y` / `Y` | Copy document · copy node under cursor as JSON (also right-click) |
+| `E` | Export the full query result to JSON / CSV (streamed) |
 | `r` | Refresh: reload the open collection (and sidebar in explorer) |
-| `Ctrl-P` / `:` | Command palette |
+| `Ctrl-P` / `:` · `Ctrl-T` | Command palette · open collection by name |
+| `Ctrl-E` | Edit the current document in `$EDITOR` |
 | `C` · `?` · `q` | Connections · help · quit |
 
 ## How it works
@@ -170,9 +203,8 @@ platforms with checksums.
 
 ## Roadmap
 
-`$EDITOR` integration for document editing · non-interactive `--eval` mode for
-scripting · server-side `killOp` on cancel · OS-keychain secrets · schema
-sampling view. Issues and PRs welcome.
+Non-interactive `--eval` mode for scripting · server-side `killOp` on cancel ·
+OS-keychain secrets · Homebrew tap. Issues and PRs welcome.
 
 ## License
 

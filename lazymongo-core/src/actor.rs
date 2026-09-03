@@ -171,7 +171,12 @@ impl Actor {
                 update,
             } => self.update_many(db, coll, filter, update).await,
             Command::ListIndexes { db, coll } => self.list_indexes(db, coll).await,
-            Command::CreateIndex { db, coll, keys } => self.create_index(db, coll, keys).await,
+            Command::CreateIndex {
+                db,
+                coll,
+                keys,
+                options,
+            } => self.create_index(db, coll, keys, options).await,
             Command::DropIndex { db, coll, name } => self.drop_index(db, coll, name).await,
             Command::CreateCollection { db, name } => self.create_collection(db, name).await,
             Command::DropCollection { db, coll } => self.drop_collection(db, coll).await,
@@ -743,12 +748,17 @@ impl Actor {
                     .into_iter()
                     .map(|m| {
                         let opts = m.options.as_ref();
+                        let mut options = opts
+                            .and_then(|o| mongodb::bson::to_document(o).ok())
+                            .unwrap_or_default();
+                        options.remove("v"); // internal version, never user-set
                         IndexInfo {
                             name: opts
                                 .and_then(|o| o.name.clone())
                                 .unwrap_or_else(|| "(unnamed)".into()),
                             keys: m.keys.clone(),
                             unique: opts.and_then(|o| o.unique).unwrap_or(false),
+                            options,
                         }
                     })
                     .collect();
@@ -758,11 +768,25 @@ impl Actor {
         }
     }
 
-    async fn create_index(&mut self, db: String, coll: String, keys: Document) {
+    async fn create_index(&mut self, db: String, coll: String, keys: Document, options: Document) {
         if !self.connected() {
             return;
         }
-        let model = IndexModel::builder().keys(keys).build();
+        // The driver's IndexOptions deserializes the same camelCase names the
+        // server documents for createIndexes, so the editor speaks server
+        // syntax and type errors are caught before any network call.
+        let opts = if options.is_empty() {
+            None
+        } else {
+            match mongodb::bson::from_document::<mongodb::options::IndexOptions>(options) {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    Self::emit_err(&self.events, format!("createIndex options: {e}")).await;
+                    return;
+                }
+            }
+        };
+        let model = IndexModel::builder().keys(keys).options(opts).build();
         match self.coll(&db, &coll).create_index(model).await {
             Ok(r) => {
                 Self::emit(
