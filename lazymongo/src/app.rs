@@ -792,9 +792,34 @@ impl App {
                     KeyCode::Char('c') => {
                         if self.guard_write() {
                             self.modal = Modal::Editor(JsonEditor {
-                                title: "Create index — key spec".into(),
-                                area: TextArea::from_text("{\n  \n}"),
-                                purpose: EditorPurpose::CreateIndexKeys,
+                                title: "Create index — { keys, options }".into(),
+                                area: TextArea::from_text(
+                                    "{\n  \"keys\": {\n    \n  },\n  \"options\": {\n    \n  }\n}",
+                                ),
+                                purpose: EditorPurpose::CreateIndexSpec,
+                                error: None,
+                            });
+                        }
+                    }
+                    KeyCode::Char('e') => {
+                        let spec = view
+                            .indexes
+                            .as_ref()
+                            .and_then(|list| list.get(view.selected))
+                            .map(|info| {
+                                let mut spec = Document::new();
+                                spec.insert("keys", Bson::Document(info.keys.clone()));
+                                spec.insert("options", Bson::Document(info.options.clone()));
+                                (info.name.clone(), spec)
+                            });
+                        let Some((name, spec)) = spec else { return };
+                        if self.guard_write() {
+                            self.modal = Modal::Editor(JsonEditor {
+                                title: format!(
+                                    "Edit index \"{name}\" — saves as a new index; rename it or drop the old one"
+                                ),
+                                area: TextArea::from_text(&util::doc_to_pretty(&spec)),
+                                purpose: EditorPurpose::CreateIndexSpec,
                                 error: None,
                             });
                         }
@@ -1068,7 +1093,7 @@ impl App {
                     });
                 }
             }
-            PendingAction::CreateIndex { keys } => {
+            PendingAction::CreateIndex { keys, options } => {
                 if let Some((db, coll)) = target {
                     self.modal = Modal::Indexes(IndexesView {
                         db: db.clone(),
@@ -1076,7 +1101,12 @@ impl App {
                         indexes: None,
                         selected: 0,
                     });
-                    self.send(Command::CreateIndex { db, coll, keys });
+                    self.send(Command::CreateIndex {
+                        db,
+                        coll,
+                        keys,
+                        options,
+                    });
                 }
             }
             PendingAction::DropIndex { name } => {
@@ -1187,20 +1217,27 @@ impl App {
                     update: parsed,
                 });
             }
-            EditorPurpose::CreateIndexKeys => {
-                if parsed.is_empty() {
-                    self.modal = Modal::Editor(JsonEditor {
-                        error: Some("index key spec cannot be empty".into()),
-                        ..editor_with(title, text, EditorPurpose::CreateIndexKeys)
-                    });
-                    return;
+            EditorPurpose::CreateIndexSpec => {
+                let (keys, options) = match split_index_spec(&parsed) {
+                    Ok(split) => split,
+                    Err(e) => {
+                        self.modal = Modal::Editor(JsonEditor {
+                            error: Some(e),
+                            ..editor_with(title, text, EditorPurpose::CreateIndexSpec)
+                        });
+                        return;
+                    }
+                };
+                let mut body = vec![format!("keys: {}", filter_display(&keys))];
+                if !options.is_empty() {
+                    body.push(format!("options: {}", filter_display(&options)));
                 }
                 self.modal = Modal::Confirm(Confirm {
                     title: "Create index".into(),
-                    body: vec![format!("keys: {}", filter_display(&parsed))],
+                    body,
                     typed_required: None,
                     typed: Input::default(),
-                    action: PendingAction::CreateIndex { keys: parsed },
+                    action: PendingAction::CreateIndex { keys, options },
                 });
             }
         }
@@ -1325,7 +1362,7 @@ impl App {
                 AppAction::UpdateMany,
             ),
             (
-                "indexes: list / create / drop (I)".into(),
+                "indexes: list / create / edit / drop (I)".into(),
                 AppAction::Indexes,
             ),
             ("operations log (L)".into(), AppAction::OpsLog),
@@ -2803,6 +2840,39 @@ fn filter_display(doc: &Document) -> String {
     }
 }
 
+/// Split index-editor content into (keys, options). Accepts the full
+/// `{ "keys": …, "options": … }` form, or a bare key spec like `{ email: 1 }`
+/// for muscle-memory compatibility (only when there is no "keys" subdocument).
+fn split_index_spec(doc: &Document) -> Result<(Document, Document), String> {
+    if !matches!(doc.get("keys"), Some(Bson::Document(_))) {
+        if doc.contains_key("options") {
+            return Err("\"options\" given but \"keys\" is missing or not a document".into());
+        }
+        if doc.is_empty() {
+            return Err("index key spec cannot be empty".into());
+        }
+        return Ok((doc.clone(), Document::new()));
+    }
+    let mut keys = Document::new();
+    let mut options = Document::new();
+    for (k, v) in doc {
+        match (k.as_str(), v) {
+            ("keys", Bson::Document(d)) => keys = d.clone(),
+            ("options", Bson::Document(d)) => options = d.clone(),
+            ("options", _) => return Err("\"options\" must be a document".into()),
+            _ => {
+                return Err(format!(
+                    "unknown top-level field \"{k}\" — use only \"keys\" and \"options\""
+                ))
+            }
+        }
+    }
+    if keys.is_empty() {
+        return Err("index key spec cannot be empty".into());
+    }
+    Ok((keys, options))
+}
+
 fn bson_display(v: &Bson) -> String {
     match v {
         Bson::ObjectId(oid) => format!("ObjectId(\"{oid}\")"),
@@ -3004,5 +3074,54 @@ fn run_mongosh(terminal: &mut term::Term, app: &mut App, uri: &str) {
     match status {
         Ok(_) => app.toast_info("back from mongosh".into()),
         Err(e) => app.toast_err(format!("could not launch mongosh: {e} (is it installed?)")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lazymongo_core::bson::doc;
+
+    #[test]
+    fn index_spec_bare_keys() {
+        let (keys, options) = split_index_spec(&doc! { "email": 1, "age": -1 }).unwrap();
+        assert_eq!(keys, doc! { "email": 1, "age": -1 });
+        assert!(options.is_empty());
+    }
+
+    #[test]
+    fn index_spec_wrapped_with_options() {
+        let spec = doc! {
+            "keys": { "email": 1 },
+            "options": { "name": "email_unique", "unique": true, "expireAfterSeconds": 3600 },
+        };
+        let (keys, options) = split_index_spec(&spec).unwrap();
+        assert_eq!(keys, doc! { "email": 1 });
+        assert_eq!(options.get_str("name"), Ok("email_unique"));
+        assert_eq!(options.get_bool("unique"), Ok(true));
+    }
+
+    #[test]
+    fn index_spec_wrapped_without_options() {
+        let (keys, options) = split_index_spec(&doc! { "keys": { "n": 1 } }).unwrap();
+        assert_eq!(keys, doc! { "n": 1 });
+        assert!(options.is_empty());
+    }
+
+    #[test]
+    fn index_spec_rejects_bad_shapes() {
+        assert!(split_index_spec(&doc! {}).is_err());
+        assert!(split_index_spec(&doc! { "keys": {} }).is_err());
+        assert!(split_index_spec(&doc! { "keys": { "n": 1 }, "unique": true }).is_err());
+        assert!(split_index_spec(&doc! { "keys": { "n": 1 }, "options": 1 }).is_err());
+        assert!(split_index_spec(&doc! { "options": { "unique": true } }).is_err());
+    }
+
+    #[test]
+    fn index_spec_field_named_keys_scalar_is_bare_spec() {
+        // `keys` as a scalar is a legitimate field name in a bare key spec.
+        let (keys, options) = split_index_spec(&doc! { "keys": 1 }).unwrap();
+        assert_eq!(keys, doc! { "keys": 1 });
+        assert!(options.is_empty());
     }
 }

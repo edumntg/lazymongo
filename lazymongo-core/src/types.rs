@@ -54,6 +54,9 @@ pub struct IndexInfo {
     pub name: String,
     pub keys: Document,
     pub unique: bool,
+    /// Index options as reported by listIndexes (camelCase field names,
+    /// `v` stripped). Used for badges in the list and to prefill the editor.
+    pub options: Document,
 }
 
 /// Full find specification (FR-12).
@@ -165,6 +168,9 @@ pub enum Command {
         db: String,
         coll: String,
         keys: Document,
+        /// createIndexes options in camelCase (`name`, `unique`,
+        /// `expireAfterSeconds`, `partialFilterExpression`, …); empty = none.
+        options: Document,
     },
     DropIndex {
         db: String,
