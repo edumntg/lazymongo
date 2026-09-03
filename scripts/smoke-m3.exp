@@ -95,17 +95,25 @@ send "y"
 gate "matched 1"
 send_user "\n=== EDIT DOC OK ===\n"
 drain 1
-# INDEXES: I -> create n_1 -> drop it
+# INDEXES: I -> create a unique n_1 via the { keys, options } editor -> drop it
 send "I"
 gate "_id_"
 send "c"
 gate "Create index"
+# template is { "keys": { <line2> }, "options": { <line5> } }
+send "\x1b\[B"
 send "\x1b\[B"
 send "\"n\": 1"
+send "\x1b\[B"
+send "\x1b\[B"
+send "\x1b\[B"
+send "\"unique\": true"
 send "\x13"
 gate "keys:"
+gate "options:"
 send "y"
 gate "n_1"
+gate "unique"
 send_user "\n=== CREATE INDEX OK ===\n"
 drain 1
 send "j"

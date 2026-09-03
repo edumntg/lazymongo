@@ -475,6 +475,62 @@ async fn write_operations_roundtrip() {
         other => panic!("expected Indexes, got {other:?}"),
     }
 
+    // Index with options: named, unique, sparse, TTL — round-trips through
+    // listIndexes into IndexInfo.options.
+    cmd.send(Command::CreateIndex {
+        db: db.clone(),
+        coll: coll.clone(),
+        keys: doc! { "email": 1 },
+        options: doc! {
+            "name": "email_unique_ttl",
+            "unique": true,
+            "sparse": true,
+            "expireAfterSeconds": 3600,
+        },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::WriteDone { summary, .. } => {
+            assert!(summary.contains("email_unique_ttl"), "{summary}")
+        }
+        other => panic!("expected WriteDone, got {other:?}"),
+    }
+    match recv(&mut evt).await {
+        CoreEvent::Indexes { indexes, .. } => {
+            let idx = indexes
+                .iter()
+                .find(|i| i.name == "email_unique_ttl")
+                .unwrap_or_else(|| panic!("index not listed: {indexes:?}"));
+            assert!(idx.unique);
+            assert_eq!(idx.options.get_bool("sparse"), Ok(true));
+            assert!(idx.options.get("expireAfterSeconds").is_some(), "{idx:?}");
+        }
+        other => panic!("expected Indexes, got {other:?}"),
+    }
+    // Invalid options must surface as an error, not silently create.
+    cmd.send(Command::CreateIndex {
+        db: db.clone(),
+        coll: coll.clone(),
+        keys: doc! { "email": 1 },
+        options: doc! { "unique": "yes" },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::Error(msg) => assert!(msg.contains("createIndex options"), "{msg}"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    cmd.send(Command::DropIndex {
+        db: db.clone(),
+        coll: coll.clone(),
+        name: "email_unique_ttl".into(),
+    })
+    .await
+    .unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::WriteDone { .. }));
+    assert!(matches!(recv(&mut evt).await, CoreEvent::Indexes { .. }));
+
     // DeleteOne then DeleteMany.
     cmd.send(Command::DeleteOne {
         db: db.clone(),
