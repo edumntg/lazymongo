@@ -134,6 +134,9 @@ and through the fuzzy **command palette** (`Ctrl-P` or `:`).
 - `--dns cloudflare|google|quad9` for `mongodb+srv://` when local or VPN DNS
   mangles SRV/TXT lookups (also a `dns` key in config.toml)
 - Credentials always redacted on screen; live server version + ping in the status bar
+- **Self-updating**: the status bar announces new releases; press `u` to
+  download, swap the binary, and restart right back into the view you had
+  (opt out with `update_check = false` in config.toml)
 - Panic-safe terminal restore; stale results dropped via generation tokens
 
 ## Connections
@@ -144,6 +147,7 @@ add / edit / delete / connect without touching a file. It persists to
 
 ```toml
 theme = "claude-dark"
+update_check = false         # optional: skip the release check at startup
 
 [[connections]]
 name = "local"
@@ -174,6 +178,7 @@ read_only = true             # RO badge + all writes blocked
 | `Ctrl-P` / `:` · `Ctrl-T` | Command palette · open collection by name |
 | `Ctrl-E` | Edit the current document in `$EDITOR` |
 | `C` · `?` · `q` | Connections · help · quit |
+| `u` | Update to the new release announced in the status bar (confirm, restart, same view) |
 
 ## How it works
 

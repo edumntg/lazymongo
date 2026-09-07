@@ -27,6 +27,7 @@ use crate::modal::{
 };
 use crate::textarea::TextArea;
 use crate::theme;
+use crate::update::{self, UpdateMsg};
 use crate::{config, event, term, ui, util};
 
 /// Memory cap: max documents held in the sliding window (NFR-3).
@@ -274,6 +275,8 @@ pub struct App {
     pub config_theme: Option<String>,
     /// dns name persisted in config.toml (kept when rewriting the file).
     pub config_dns: Option<String>,
+    /// update_check flag persisted in config.toml (kept when rewriting).
+    pub config_update_check: Option<bool>,
     /// The real (unredacted) URI of the active connection, for `m` (mongosh).
     active_uri: Option<String>,
     /// DNS resolver for +srv lookups (config `dns` / --dns).
@@ -284,6 +287,16 @@ pub struct App {
     pub pending_external: Option<(String, String, EditorPurpose)>,
     /// Set by Ctrl-L; the run loop clears the terminal for a full repaint.
     pub pending_clear: bool,
+    /// Background update checker/installer reports through this channel.
+    update_tx: std::sync::mpsc::Sender<UpdateMsg>,
+    update_rx: std::sync::mpsc::Receiver<UpdateMsg>,
+    /// Newer release version (no `v` prefix); shown in the status bar.
+    pub update_available: Option<String>,
+    pub update_installing: bool,
+    /// Set when the new binary is on disk; the run loop exits and main execs it.
+    pub restart: Option<update::Restart>,
+    /// View to restore after an update restart (applied once connected).
+    pending_resume: Option<update::ResumeInfo>,
     pub toast: Option<(String, bool, Instant)>, // (message, is_error, when)
     pub spinner_frame: usize,
     pub should_quit: bool,
@@ -302,6 +315,7 @@ impl App {
         cancel_tx: watch::Sender<u64>,
         read_only: bool,
     ) -> Self {
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
         Self {
             conn: ConnState::Connecting,
             uri_display,
@@ -323,11 +337,18 @@ impl App {
             cancel_tx,
             config_theme: None,
             config_dns: None,
+            config_update_check: None,
             active_uri: None,
             dns: DnsResolver::System,
             pending_shell: false,
             pending_external: None,
             pending_clear: false,
+            update_tx,
+            update_rx,
+            update_available: None,
+            update_installing: false,
+            restart: None,
+            pending_resume: None,
             toast: None,
             spinner_frame: 0,
             should_quit: false,
@@ -373,6 +394,9 @@ impl App {
                 };
                 self.explorer.loading = true;
                 self.send(Command::ListDatabases);
+                if let Some(r) = self.pending_resume.take() {
+                    self.apply_resume(r);
+                }
             }
             CoreEvent::ConnectFailed(e) => {
                 // Long driver errors get truncated in the status bar; keep
@@ -607,6 +631,94 @@ impl App {
                 self.toast = None;
             }
         }
+        while let Ok(msg) = self.update_rx.try_recv() {
+            self.on_update_msg(msg);
+        }
+    }
+
+    // ---------- self-update ----------
+
+    fn on_update_msg(&mut self, msg: UpdateMsg) {
+        match msg {
+            UpdateMsg::Available(v) => {
+                self.toast_info(format!("lazymongo v{v} is available — press u to update"));
+                self.update_available = Some(v);
+            }
+            UpdateMsg::Installed { exe } => {
+                self.restart = Some(update::Restart {
+                    exe,
+                    resume: self.resume_info(),
+                });
+                self.should_quit = true;
+            }
+            UpdateMsg::InstallFailed(e) => {
+                self.update_installing = false;
+                self.toast_err(format!("update failed: {e}"));
+            }
+        }
+    }
+
+    /// Snapshot of the current view, restored after the update restart.
+    fn resume_info(&self) -> update::ResumeInfo {
+        let (db, coll) = match &self.results.target {
+            Some((d, c)) => (Some(d.clone()), Some(c.clone())),
+            None => (None, None),
+        };
+        update::ResumeInfo {
+            uri: self.active_uri.clone(),
+            db,
+            coll,
+            filter: self.query.input.clone(),
+            view: match self.view {
+                ViewMode::Table => "table".into(),
+                ViewMode::Json => "json".into(),
+            },
+            read_only: self.read_only,
+        }
+    }
+
+    fn prompt_self_update(&mut self) {
+        let Some(version) = self.update_available.clone() else {
+            return;
+        };
+        if self.update_installing {
+            return;
+        }
+        self.modal = Modal::Confirm(Confirm {
+            title: "update lazymongo".into(),
+            body: vec![
+                format!("v{} → v{version}", update::CURRENT),
+                "download the new release and restart?".into(),
+                "the current view will be restored after the restart.".into(),
+            ],
+            typed_required: None,
+            typed: Input::default(),
+            action: PendingAction::SelfUpdate { version },
+        });
+    }
+
+    /// Reopen the namespace/filter/view saved before an update restart.
+    fn apply_resume(&mut self, r: update::ResumeInfo) {
+        self.view = if r.view == "table" {
+            ViewMode::Table
+        } else {
+            ViewMode::Json
+        };
+        let (Some(db), Some(coll)) = (r.db, r.coll) else {
+            return;
+        };
+        self.query.input = r.filter;
+        self.query.cursor = self.query.input.chars().count();
+        self.focus = Pane::Results;
+        let filter = parse_filter(&self.query.input).unwrap_or_default();
+        self.start_find(
+            db,
+            coll,
+            FindSpec {
+                filter,
+                ..FindSpec::default()
+            },
+        );
     }
 
     // ---------- input ----------
@@ -671,6 +783,7 @@ impl App {
             KeyCode::Char('3') => self.focus = Pane::Query,
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('C') => self.open_connections(),
+            KeyCode::Char('u') if self.update_available.is_some() => self.prompt_self_update(),
             _ => match self.focus {
                 Pane::Explorer => self.on_key_explorer(key),
                 Pane::Results => self.on_key_results(key),
@@ -996,6 +1109,7 @@ impl App {
         let cfg = config::Config {
             theme: self.config_theme.clone(),
             dns: self.config_dns.clone(),
+            update_check: self.config_update_check,
             connections: items.clone(),
         };
         match config::save_config(&cfg) {
@@ -1133,6 +1247,7 @@ impl App {
                 let cfg = config::Config {
                     theme: self.config_theme.clone(),
                     dns: self.config_dns.clone(),
+                    update_check: self.config_update_check,
                     connections: items.clone(),
                 };
                 match config::save_config(&cfg) {
@@ -1141,6 +1256,11 @@ impl App {
                 }
                 let selected = index.min(items.len().saturating_sub(1));
                 self.modal = Modal::Connections { items, selected };
+            }
+            PendingAction::SelfUpdate { version } => {
+                self.update_installing = true;
+                self.toast_info(format!("downloading v{version}…"));
+                update::spawn_install(version, self.update_tx.clone());
             }
         }
     }
@@ -1391,6 +1511,9 @@ impl App {
             "open collection\u{2026} (ctrl-t)".into(),
             AppAction::NsSwitcher,
         ));
+        if let Some(v) = &self.update_available {
+            actions.push((format!("app: update to v{v} (u)"), AppAction::SelfUpdate));
+        }
         self.modal = Modal::Palette(Palette::new(
             "Command palette \u{2500} \u{21b5} run \u{b7} esc close",
             actions,
@@ -1459,6 +1582,7 @@ impl App {
             AppAction::Refresh => self.refresh(),
             AppAction::Help => self.modal = Modal::Help,
             AppAction::Quit => self.should_quit = true,
+            AppAction::SelfUpdate => self.prompt_self_update(),
             AppAction::SetTheme(name) => {
                 if theme::set_by_name(name) {
                     self.config_theme = Some(name.to_string());
@@ -2971,15 +3095,34 @@ pub async fn run(
     uri: Option<String>,
     read_only: bool,
     dns: DnsResolver,
-) -> Result<()> {
-    let (cmd_tx, mut core_rx, cancel_tx) = actor::spawn(read_only);
-    let mut input_rx = event::input_channel();
+    resume: Option<update::ResumeInfo>,
+) -> Result<Option<update::Restart>> {
+    let (cmd_tx, core_rx, cancel_tx) = actor::spawn(read_only);
+    let input_rx = event::input_channel();
     let mut app = App::new(String::new(), cmd_tx, cancel_tx, read_only);
+    let mut check_updates = true;
     if let Ok(cfg) = config::load_config() {
         app.config_theme = cfg.theme;
         app.config_dns = cfg.dns;
+        app.config_update_check = cfg.update_check;
+        check_updates = cfg.update_check.unwrap_or(true);
     }
     app.dns = dns;
+    if check_updates {
+        update::spawn_check(app.update_tx.clone());
+    }
+
+    // After a self-update restart: reconnect and restore the saved view,
+    // skipping the connection picker.
+    let resume_uri = resume.as_ref().and_then(|r| r.uri.clone());
+    if let (Some(r), Some(uri)) = (resume, resume_uri) {
+        app.pending_resume = Some(r);
+        app.uri_display = redact_uri(&uri);
+        app.active_uri = Some(uri.clone());
+        let dns = app.dns;
+        app.send(Command::Connect { uri, dns });
+        return run_loop(terminal, app, input_rx, core_rx).await;
+    }
 
     match uri {
         Some(uri) => {
@@ -3011,6 +3154,15 @@ pub async fn run(
         },
     }
 
+    run_loop(terminal, app, input_rx, core_rx).await
+}
+
+async fn run_loop(
+    terminal: &mut term::Term,
+    mut app: App,
+    mut input_rx: mpsc::Receiver<Event>,
+    mut core_rx: mpsc::Receiver<CoreEvent>,
+) -> Result<Option<update::Restart>> {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -3043,7 +3195,7 @@ pub async fn run(
             let _ = terminal.clear();
         }
     }
-    Ok(())
+    Ok(app.restart.take())
 }
 
 /// Suspend the TUI, open $VISUAL/$EDITOR on the content, resume, and route

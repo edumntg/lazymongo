@@ -116,6 +116,19 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
     }
+    if app.update_installing {
+        spans.push(sep.clone());
+        spans.push(Span::styled(
+            format!("{} updating…", spinner(app)),
+            Style::new().fg(theme::warn()),
+        ));
+    } else if let Some(v) = &app.update_available {
+        spans.push(sep.clone());
+        spans.push(Span::styled(
+            format!("⬆ v{v} available — u to update"),
+            Style::new().fg(theme::warn()).add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some((msg, is_err, _)) = &app.toast {
         spans.push(sep);
         spans.push(Span::styled(
@@ -1515,6 +1528,10 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
             txt("refresh: reload collection (+ sidebar)"),
         ]),
         Line::from(vec![key("C"), txt("connection manager (add/edit/switch)")]),
+        Line::from(vec![
+            key("u"),
+            txt("update lazymongo (when the status bar shows a new version)"),
+        ]),
         Line::from(vec![key("^p / :"), txt("command palette (incl. themes)")]),
         Line::from(vec![key("^t"), txt("open collection by name (fuzzy)")]),
         Line::from(vec![key("?"), txt("toggle this help")]),

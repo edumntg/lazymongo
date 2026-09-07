@@ -47,6 +47,9 @@ pub struct Config {
     /// local/VPN DNS mangles SRV records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<String>,
+    /// Set to false to skip the GitHub release check at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_check: Option<bool>,
     #[serde(default)]
     pub connections: Vec<SavedConnection>,
 }
@@ -143,6 +146,7 @@ mod tests {
         let body = toml::to_string_pretty(&Config {
             theme: Some("claude-dark".into()),
             dns: Some("cloudflare".into()),
+            update_check: Some(false),
             connections: conns.clone(),
         })
         .unwrap();

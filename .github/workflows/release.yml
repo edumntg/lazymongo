@@ -1,8 +1,11 @@
 name: Release
 
-# Tag a release with:  git tag v0.1.0 && git push origin v0.1.0
+# Runs on every push to main: if Cargo.toml's version has no release yet,
+# it builds all targets and publishes release v<version> (creating the tag).
+# Pushing a v* tag by hand still works: git tag v0.2.0 && git push origin v0.2.0
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
 
 permissions:
@@ -12,8 +15,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      exists: ${{ steps.v.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build (${{ matrix.target }})
+    needs: version
+    if: needs.version.outputs.exists == 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +75,7 @@ jobs:
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ needs.version.outputs.version }}"
           NAME="lazymongo-${VERSION}-${{ matrix.target }}"
           mkdir "$NAME"
           cp "target/${{ matrix.target }}/release/lazymongo" README.md "$NAME/"
@@ -57,7 +86,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
+          $version = "${{ needs.version.outputs.version }}"
           $name = "lazymongo-$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/lazymongo.exe", "README.md" $name
@@ -73,7 +102,7 @@ jobs:
 
   release:
     name: publish GitHub release
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -82,6 +111,7 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.version.outputs.version }}
           files: |
             lazymongo-*.tar.gz*
             lazymongo-*.zip*
