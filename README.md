@@ -162,6 +162,7 @@ read_only = true             # RO badge + all writes blocked
 | `Tab` / `1` `2` `3` | Switch pane (explorer / results / query) |
 | `↑↓` `jk` / mouse wheel | Move |
 | `Enter` | Expand db · open collection · fold/unfold |
+| `z` | Expand / collapse all nested fields of the doc under the cursor |
 | `3` + type + `Enter` | Run a filter |
 | `F` | Query editor (projection / sort / limit / skip) |
 | `v` · `o` · `x` · `S` | Table view · doc view · explain · schema |

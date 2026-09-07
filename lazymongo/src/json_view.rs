@@ -105,6 +105,45 @@ fn short_value(v: &Bson) -> Span<'static> {
     }
 }
 
+/// Fold paths of every nested container (document or array) in `doc`,
+/// excluding the root path `""` — i.e. everything `collapse all` should fold
+/// while keeping the document's first level visible.
+pub fn foldable_paths(doc: &Document) -> HashSet<String> {
+    fn walk(v: &Bson, path: &str, out: &mut HashSet<String>) {
+        match v {
+            Bson::Document(d) => {
+                out.insert(path.to_string());
+                for (k, v) in d.iter() {
+                    walk(v, &format!("{path}.{k}"), out);
+                }
+            }
+            Bson::Array(items) => {
+                out.insert(path.to_string());
+                for (i, v) in items.iter().enumerate() {
+                    walk(v, &format!("{path}.{i}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for (k, v) in doc.iter() {
+        walk(v, k, &mut out);
+    }
+    out
+}
+
+/// Toggle between fully expanded and all-inner-containers collapsed:
+/// any existing fold (including a collapsed whole doc) -> expand everything;
+/// fully expanded -> collapse every nested object/array.
+pub fn toggle_all_folds(doc: &Document, folds: &mut HashSet<String>) {
+    if folds.is_empty() {
+        *folds = foldable_paths(doc);
+    } else {
+        folds.clear();
+    }
+}
+
 /// Render one document into lines. `number` is the absolute 1-based document
 /// number (survives window eviction). `folds` holds collapsed paths.
 pub fn doc_lines(
@@ -273,5 +312,37 @@ fn render_entry(
                 ]),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lazymongo_core::bson::doc;
+
+    #[test]
+    fn foldable_paths_nested() {
+        let d = doc! {
+            "a": 1,
+            "b": { "c": { "d": 2 }, "e": [1, { "f": 3 }] },
+        };
+        let paths = foldable_paths(&d);
+        let mut got: Vec<&str> = paths.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, ["b", "b.c", "b.e", "b.e.1"]);
+    }
+
+    #[test]
+    fn toggle_all_folds_round_trip() {
+        let d = doc! { "b": { "c": 1 } };
+        let mut folds = HashSet::new();
+        toggle_all_folds(&d, &mut folds); // expanded -> all collapsed
+        assert!(folds.contains("b"));
+        toggle_all_folds(&d, &mut folds); // any folds -> all expanded
+        assert!(folds.is_empty());
+        // A whole-doc collapse also expands on toggle.
+        folds.insert(String::new());
+        toggle_all_folds(&d, &mut folds);
+        assert!(folds.is_empty());
     }
 }

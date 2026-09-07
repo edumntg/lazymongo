@@ -1571,6 +1571,10 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::raw(""),
         head("Results · json view"),
         Line::from(vec![key("↵ / space"), txt("fold / unfold at cursor")]),
+        Line::from(vec![
+            key("z"),
+            txt("expand / collapse all nested fields of the doc"),
+        ]),
         Line::from(vec![key("^d ^u g G"), txt("scroll / jump")]),
         Line::raw(""),
         head("Results · table view"),
