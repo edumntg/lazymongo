@@ -1,11 +1,10 @@
 name: Release
 
-# Runs on every push to main: if Cargo.toml's version has no release yet,
-# it builds all targets and publishes release v<version> (creating the tag).
-# Pushing a v* tag by hand still works: git tag v0.2.0 && git push origin v0.2.0
+# Releases are manual: tag and push, e.g.
+#   git tag v0.3.0 && git push origin v0.3.0
+# The version job guards against re-publishing an already-released version.
 on:
   push:
-    branches: ["main"]
     tags: ["v*"]
 
 permissions:
