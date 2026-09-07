@@ -169,6 +169,22 @@ impl AggState {
         }
         self.rebuild_lines();
     }
+
+    /// z: expand/collapse every nested object/array of the doc under the cursor.
+    pub fn toggle_fold_all_at_cursor(&mut self) {
+        let Some(rline) = self.lines.get(self.cursor) else {
+            return;
+        };
+        let doc_idx = rline.doc_idx;
+        crate::json_view::toggle_all_folds(&self.docs[doc_idx], &mut self.folds[doc_idx]);
+        self.rebuild_lines();
+        // Snap to the doc header: the line the cursor was on may be folded away.
+        self.cursor = self
+            .lines
+            .iter()
+            .take_while(|l| l.doc_idx < doc_idx)
+            .count();
+    }
 }
 
 /// Numeric value of a BSON scalar, if any.

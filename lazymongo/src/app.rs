@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::agg::{AggFocus, AggState, AGG_PREVIEW_LIMIT, DEFAULT_PIPELINE};
 use crate::input::{char_to_byte, Input};
-use crate::json_view::{doc_lines, RLine};
+use crate::json_view::{doc_lines, toggle_all_folds, RLine};
 use crate::modal::{
     AppAction, Confirm, ConnForm, DocView, EditorPurpose, IndexesView, JsonEditor, Modal, Palette,
     PendingAction, Prompt, PromptAction, QueryEditor, SchemaView,
@@ -702,6 +702,7 @@ impl App {
                         view.cursor = view.lines.len().saturating_sub(1)
                     }
                     KeyCode::Enter | KeyCode::Char(' ') => view.toggle_fold_at_cursor(),
+                    KeyCode::Char('z') => view.toggle_fold_all(),
                     KeyCode::Char('y') => {
                         let text = util::doc_to_pretty(&view.doc);
                         match util::clipboard_copy(&text) {
@@ -1341,6 +1342,10 @@ impl App {
             ),
             ("query: explain plan (x)".into(), AppAction::Explain),
             ("doc: open full-screen (o)".into(), AppAction::DocView),
+            (
+                "doc: expand/collapse all nested fields (z)".into(),
+                AppAction::ToggleFoldAll,
+            ),
             ("doc: copy to clipboard (y)".into(), AppAction::CopyDoc),
             (
                 "doc: copy node under cursor as json (Y)".into(),
@@ -1437,6 +1442,7 @@ impl App {
             AppAction::QueryEditor => self.open_query_editor(),
             AppAction::Explain => self.explain_current(),
             AppAction::DocView => self.open_doc_view(),
+            AppAction::ToggleFoldAll => self.toggle_fold_all_at_cursor(),
             AppAction::CopyDoc => self.copy_current_doc(),
             AppAction::CopyNode => self.copy_current_node(),
             AppAction::Export => self.export_results(),
@@ -2039,6 +2045,7 @@ impl App {
                 KeyCode::Home => agg.cursor = 0,
                 KeyCode::Char('G') | KeyCode::End => agg.cursor = agg.lines.len().saturating_sub(1),
                 KeyCode::Enter | KeyCode::Char(' ') => agg.toggle_fold_at_cursor(),
+                KeyCode::Char('z') => agg.toggle_fold_all_at_cursor(),
                 KeyCode::Char('y') => {
                     let doc = agg
                         .lines
@@ -2158,6 +2165,7 @@ impl App {
                 self.maybe_fetch_more();
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.toggle_fold_at_cursor(),
+            KeyCode::Char('z') => self.toggle_fold_all_at_cursor(),
             _ => {}
         }
     }
@@ -2454,6 +2462,27 @@ impl App {
             .filter(|l| l.doc_idx == doc_idx)
             .count();
         self.results.cursor = doc_start + offset_in_doc.min(doc_len.saturating_sub(1));
+    }
+
+    /// z: expand/collapse every nested object/array of the doc under the
+    /// cursor (any fold present -> expand all; fully expanded -> fold all).
+    fn toggle_fold_all_at_cursor(&mut self) {
+        let Some(rline) = self.results.lines.get(self.results.cursor) else {
+            return;
+        };
+        let doc_idx = rline.doc_idx;
+        toggle_all_folds(
+            &self.results.docs[doc_idx],
+            &mut self.results.folds[doc_idx],
+        );
+        self.results.rebuild_lines();
+        // Snap to the doc header: the line the cursor was on may be folded away.
+        self.results.cursor = self
+            .results
+            .lines
+            .iter()
+            .take_while(|l| l.doc_idx < doc_idx)
+            .count();
     }
 
     // ---------- query bar ----------

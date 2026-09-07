@@ -116,6 +116,14 @@ impl DocView {
         }
         self.rebuild();
     }
+
+    /// z: expand/collapse every nested object/array at once.
+    pub fn toggle_fold_all(&mut self) {
+        crate::json_view::toggle_all_folds(&self.doc, &mut self.folds);
+        self.cursor = 0;
+        self.scroll = 0;
+        self.rebuild();
+    }
 }
 
 /// A destructive (or write) action waiting for confirmation (FR-29/30/31).
@@ -304,6 +312,7 @@ pub enum AppAction {
     QueryEditor,
     Explain,
     DocView,
+    ToggleFoldAll,
     CopyDoc,
     CopyNode,
     Export,
