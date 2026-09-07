@@ -159,8 +159,9 @@ pub enum PendingAction {
         index: usize,
     },
     /// Download the new release, swap the binary, and restart.
+    /// `tag` is the release's actual tag name (e.g. "v0.3.0").
     SelfUpdate {
-        version: String,
+        tag: String,
     },
 }
 

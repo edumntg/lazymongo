@@ -14,13 +14,21 @@ pub const REPO: &str = "edumntg/lazymongo";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 pub enum UpdateMsg {
-    /// A newer release exists (version without the `v` prefix).
-    Available(String),
+    /// A newer release with a binary for this platform exists; `tag` is the
+    /// release's actual tag name (usually but not necessarily `v`-prefixed).
+    Available {
+        tag: String,
+    },
     /// Binary swapped on disk; `exe` is the path to the new executable.
     Installed {
         exe: PathBuf,
     },
     InstallFailed(String),
+}
+
+/// Human version of a release tag: `v0.3.0` and `0.3.0` both -> `0.3.0`.
+pub fn display_version(tag: &str) -> &str {
+    tag.strip_prefix('v').unwrap_or(tag)
 }
 
 /// What `main` needs to relaunch the app after a successful update.
@@ -48,23 +56,31 @@ pub struct ResumeInfo {
 pub const RESUME_ENV: &str = "LAZYMONGO_RESUME";
 
 /// Fire-and-forget release check; sends `Available` only when the latest
-/// release is strictly newer than the running version.
+/// release is strictly newer than the running version AND actually has a
+/// binary for this platform (hand-made releases may ship no assets).
 pub fn spawn_check(tx: Sender<UpdateMsg>) {
     std::thread::spawn(move || {
-        let Some(latest) = fetch_latest_version() else {
+        let Some(tag) = fetch_latest_tag() else {
             return;
         };
-        if is_newer(&latest, CURRENT) {
-            let _ = tx.send(UpdateMsg::Available(latest));
+        if !is_newer(display_version(&tag), CURRENT) {
+            return;
         }
+        let Ok(target) = target() else {
+            return;
+        };
+        if curl(&["-I", &asset_url(&tag, target)]).is_err() {
+            return;
+        }
+        let _ = tx.send(UpdateMsg::Available { tag });
     });
 }
 
 /// Download the release asset for this platform, swap the current
 /// executable, and report the result.
-pub fn spawn_install(version: String, tx: Sender<UpdateMsg>) {
+pub fn spawn_install(tag: String, tx: Sender<UpdateMsg>) {
     std::thread::spawn(move || {
-        let msg = match install(&version) {
+        let msg = match install(&tag) {
             Ok(exe) => UpdateMsg::Installed { exe },
             Err(e) => UpdateMsg::InstallFailed(e),
         };
@@ -87,17 +103,16 @@ fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-fn fetch_latest_version() -> Option<String> {
+fn fetch_latest_tag() -> Option<String> {
     let body = curl(&[&format!(
         "https://api.github.com/repos/{REPO}/releases/latest"
     )])
     .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
     let tag = json.get("tag_name")?.as_str()?;
-    let version = tag.strip_prefix('v').unwrap_or(tag);
     // Non-semver tags (e.g. a hand-made "stable" release) are ignored.
-    parse_version(version)?;
-    Some(version.to_string())
+    parse_version(display_version(tag))?;
+    Some(tag.to_string())
 }
 
 /// Cargo target triple of the running binary, mirroring release.yml's matrix.
@@ -121,17 +136,27 @@ fn asset_name(version: &str, target: &str) -> String {
     format!("lazymongo-{version}-{target}.{ext}")
 }
 
+/// Download URL for this platform's asset in the release tagged `tag`.
+/// release.yml names assets by the tag with any `v` prefix stripped.
+fn asset_url(tag: &str, target: &str) -> String {
+    let asset = asset_name(display_version(tag), target);
+    format!("https://github.com/{REPO}/releases/download/{tag}/{asset}")
+}
+
 /// Download + extract + swap. Returns the path of the (new) executable.
-fn install(version: &str) -> Result<PathBuf, String> {
+fn install(tag: &str) -> Result<PathBuf, String> {
     let target = target()?;
+    let version = display_version(tag);
     let asset = asset_name(version, target);
-    let url = format!("https://github.com/{REPO}/releases/download/v{version}/{asset}");
+    let url = asset_url(tag, target);
 
     let work = std::env::temp_dir().join(format!("lazymongo-update-{version}"));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let archive = work.join(&asset);
-    curl(&["-o", &archive.to_string_lossy(), &url]).map_err(|e| format!("download: {e}"))?;
+    curl(&["-o", &archive.to_string_lossy(), &url]).map_err(|e| {
+        format!("download of {url} failed — does release {tag} have a {target} asset (published by the v* tag workflow)? {e}")
+    })?;
 
     // bsdtar (shipped on macOS and Windows 10+) also extracts zip.
     let status = Command::new("tar")
@@ -227,6 +252,26 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));
         assert!(!is_newer("stable", "0.1.0")); // non-semver tag ignored
+    }
+
+    #[test]
+    fn asset_url_uses_actual_tag() {
+        // v-prefixed tag (workflow releases) and bare tag (hand-made) both
+        // point at the real tag path, with the version-only asset name.
+        assert_eq!(
+            asset_url("v0.3.0", "aarch64-apple-darwin"),
+            "https://github.com/edumntg/lazymongo/releases/download/v0.3.0/lazymongo-0.3.0-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            asset_url("0.3.0", "aarch64-apple-darwin"),
+            "https://github.com/edumntg/lazymongo/releases/download/0.3.0/lazymongo-0.3.0-aarch64-apple-darwin.tar.gz"
+        );
+    }
+
+    #[test]
+    fn display_version_strips_v() {
+        assert_eq!(display_version("v0.3.0"), "0.3.0");
+        assert_eq!(display_version("0.3.0"), "0.3.0");
     }
 
     #[test]
