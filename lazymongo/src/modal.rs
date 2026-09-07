@@ -158,6 +158,10 @@ pub enum PendingAction {
         items: Vec<SavedConnection>,
         index: usize,
     },
+    /// Download the new release, swap the binary, and restart.
+    SelfUpdate {
+        version: String,
+    },
 }
 
 /// Confirmation modal. When `typed_required` is set, the user must type
@@ -329,6 +333,7 @@ pub enum AppAction {
     Refresh,
     Help,
     Quit,
+    SelfUpdate,
     SetTheme(&'static str),
 }
 

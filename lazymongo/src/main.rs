@@ -9,6 +9,7 @@ mod term;
 mod textarea;
 mod theme;
 mod ui;
+mod update;
 mod util;
 
 use anyhow::Result;
@@ -98,9 +99,42 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Relaunched after a self-update: restore the previous session. The
+    // resume payload travels in an env var (never on disk — the URI may
+    // contain credentials) and is consumed here so children don't inherit it.
+    let resume: Option<update::ResumeInfo> = std::env::var(update::RESUME_ENV)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    std::env::remove_var(update::RESUME_ENV);
+    if let Some(r) = &resume {
+        read_only |= r.read_only;
+    }
+
     term::install_panic_hook();
     let mut terminal = term::init()?;
-    let result = app::run(&mut terminal, uri, read_only, dns).await;
+    let result = app::run(&mut terminal, uri, read_only, dns, resume).await;
     term::restore();
-    result
+    match result? {
+        Some(restart) => relaunch(restart),
+        None => Ok(()),
+    }
+}
+
+/// Replace this process with the freshly installed binary, carrying the
+/// view to restore in LAZYMONGO_RESUME.
+fn relaunch(restart: update::Restart) -> Result<()> {
+    let resume = serde_json::to_string(&restart.resume)?;
+    let mut cmd = std::process::Command::new(&restart.exe);
+    cmd.env(update::RESUME_ENV, resume);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec(); // only returns on failure
+        anyhow::bail!("failed to relaunch {}: {err}", restart.exe.display());
+    }
+    #[cfg(not(unix))]
+    {
+        cmd.spawn()?;
+        Ok(())
+    }
 }
