@@ -122,10 +122,13 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             format!("{} updating…", spinner(app)),
             Style::new().fg(theme::warn()),
         ));
-    } else if let Some(v) = &app.update_available {
+    } else if let Some(tag) = &app.update_available {
         spans.push(sep.clone());
         spans.push(Span::styled(
-            format!("⬆ v{v} available — u to update"),
+            format!(
+                "⬆ v{} available — u to update",
+                crate::update::display_version(tag)
+            ),
             Style::new().fg(theme::warn()).add_modifier(Modifier::BOLD),
         ));
     }

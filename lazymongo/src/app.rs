@@ -290,7 +290,7 @@ pub struct App {
     /// Background update checker/installer reports through this channel.
     update_tx: std::sync::mpsc::Sender<UpdateMsg>,
     update_rx: std::sync::mpsc::Receiver<UpdateMsg>,
-    /// Newer release version (no `v` prefix); shown in the status bar.
+    /// Tag of a newer release (e.g. "v0.3.0"); shown in the status bar.
     pub update_available: Option<String>,
     pub update_installing: bool,
     /// Set when the new binary is on disk; the run loop exits and main execs it.
@@ -640,9 +640,12 @@ impl App {
 
     fn on_update_msg(&mut self, msg: UpdateMsg) {
         match msg {
-            UpdateMsg::Available(v) => {
-                self.toast_info(format!("lazymongo v{v} is available — press u to update"));
-                self.update_available = Some(v);
+            UpdateMsg::Available { tag } => {
+                self.toast_info(format!(
+                    "lazymongo v{} is available — press u to update",
+                    update::display_version(&tag)
+                ));
+                self.update_available = Some(tag);
             }
             UpdateMsg::Installed { exe } => {
                 self.restart = Some(update::Restart {
@@ -653,7 +656,11 @@ impl App {
             }
             UpdateMsg::InstallFailed(e) => {
                 self.update_installing = false;
-                self.toast_err(format!("update failed: {e}"));
+                // The status bar truncates long errors; keep the full text
+                // reachable via the ops log (L), like connect failures.
+                self.ops_log
+                    .push(format!("{}  update failed: {e}", util::clock_utc()));
+                self.toast_err("update failed (L: full error)".into());
             }
         }
     }
@@ -678,7 +685,7 @@ impl App {
     }
 
     fn prompt_self_update(&mut self) {
-        let Some(version) = self.update_available.clone() else {
+        let Some(tag) = self.update_available.clone() else {
             return;
         };
         if self.update_installing {
@@ -687,13 +694,13 @@ impl App {
         self.modal = Modal::Confirm(Confirm {
             title: "update lazymongo".into(),
             body: vec![
-                format!("v{} → v{version}", update::CURRENT),
+                format!("v{} → v{}", update::CURRENT, update::display_version(&tag)),
                 "download the new release and restart?".into(),
                 "the current view will be restored after the restart.".into(),
             ],
             typed_required: None,
             typed: Input::default(),
-            action: PendingAction::SelfUpdate { version },
+            action: PendingAction::SelfUpdate { tag },
         });
     }
 
@@ -1257,10 +1264,10 @@ impl App {
                 let selected = index.min(items.len().saturating_sub(1));
                 self.modal = Modal::Connections { items, selected };
             }
-            PendingAction::SelfUpdate { version } => {
+            PendingAction::SelfUpdate { tag } => {
                 self.update_installing = true;
-                self.toast_info(format!("downloading v{version}…"));
-                update::spawn_install(version, self.update_tx.clone());
+                self.toast_info(format!("downloading v{}…", update::display_version(&tag)));
+                update::spawn_install(tag, self.update_tx.clone());
             }
         }
     }
@@ -1511,8 +1518,11 @@ impl App {
             "open collection\u{2026} (ctrl-t)".into(),
             AppAction::NsSwitcher,
         ));
-        if let Some(v) = &self.update_available {
-            actions.push((format!("app: update to v{v} (u)"), AppAction::SelfUpdate));
+        if let Some(tag) = &self.update_available {
+            actions.push((
+                format!("app: update to v{} (u)", update::display_version(tag)),
+                AppAction::SelfUpdate,
+            ));
         }
         self.modal = Modal::Palette(Palette::new(
             "Command palette \u{2500} \u{21b5} run \u{b7} esc close",

@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "lazymongo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "lazymongo-core",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "lazymongo-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "futures-util",
