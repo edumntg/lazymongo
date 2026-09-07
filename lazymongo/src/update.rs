@@ -165,7 +165,10 @@ fn install(version: &str) -> Result<PathBuf, String> {
         .and_then(|p| p.canonicalize())
         .map_err(|e| format!("current_exe: {e}"))?;
     // Stage next to the target so the final rename is same-filesystem.
+    // Remove any leftover first: overwriting a binary in place invalidates
+    // its code-signature cache on macOS and the kernel SIGKILLs it.
     let staged = exe.with_extension("update");
+    let _ = std::fs::remove_file(&staged);
     std::fs::copy(&new_bin, &staged).map_err(|e| format!("staging update: {e}"))?;
     #[cfg(unix)]
     {
