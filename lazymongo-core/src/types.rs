@@ -90,8 +90,13 @@ pub enum Command {
         coll: String,
         spec: FindSpec,
     },
-    /// Pull the next batch from the live cursor, if generation still matches.
+    /// Pull the next batch from the live cursor opened for `generation`.
     NextBatch {
+        generation: u64,
+    },
+    /// Release the live cursor of a query the UI no longer shows (the pane
+    /// re-queried or was closed). Unknown generations are ignored.
+    CloseFind {
         generation: u64,
     },
     /// Explain the given find with executionStats verbosity (FR-15).

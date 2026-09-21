@@ -14,7 +14,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::agg::{AggFocus, AggState, ChartKind, XKind};
-use crate::app::{App, ConnState, ExplorerRow, Pane, Screen, ViewMode};
+use crate::app::{App, ConnState, ExplorerRow, Pane, Results, Screen, ViewMode};
 use crate::config::SavedConnection;
 use crate::modal::{
     Confirm, ConnForm, DocView, IndexesView, JsonEditor, Modal, Palette, Prompt, QueryEditor,
@@ -49,12 +49,32 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(20)]).areas(main);
 
     app.explorer_area = explorer;
-    app.results_area = results;
     app.query_area = query;
+    if app.other.is_some() {
+        // Split: two results panes side by side; the active one may be on
+        // either side.
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Min(10)]).areas(results);
+        (app.results_area, app.other_area) = if app.active_right {
+            (right, left)
+        } else {
+            (left, right)
+        };
+    } else {
+        app.results_area = results;
+        app.other_area = Rect::default();
+    }
 
     draw_status(f, app, status);
     draw_explorer(f, app, explorer);
-    draw_results(f, app, results);
+    let spin = spinner(app);
+    let focused = app.focus == Pane::Results;
+    let (view, area) = (app.view, app.results_area);
+    draw_results(f, &mut app.results, view, focused, true, spin, area);
+    let other_area = app.other_area;
+    if let Some(o) = &mut app.other {
+        draw_results(f, &mut o.results, o.view, false, false, spin, other_area);
+    }
     draw_query(f, app, query);
     draw_help_bar(f, app, help);
     draw_modal(f, app);
@@ -271,42 +291,42 @@ fn draw_explorer(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn results_title(app: &App) -> String {
-    match &app.results.target {
-        None => " 2 Results ".to_string(),
+/// `numbered`: the active pane carries the "2" hotkey label; the parked
+/// pane of a split does not (tab / click reach it), which also marks which
+/// pane the query bar and explorer act on.
+fn results_title(r: &Results, view: ViewMode, spin: &str, numbered: bool) -> String {
+    let num = if numbered { "2 " } else { "" };
+    match &r.target {
+        None => format!(" {num}Results "),
         Some((db, coll)) => {
-            let view = match app.view {
+            let view = match view {
                 ViewMode::Json => "json",
                 ViewMode::Table => "table",
             };
-            let mut t = format!(" 2 Results ─ {db}.{coll} [{view}] ");
-            if let Some(total) = app.results.total_estimate {
+            let mut t = format!(" {num}Results ─ {db}.{coll} [{view}] ");
+            if let Some(total) = r.total_estimate {
                 t.push_str(&format!("~{} docs ", human_count(total)));
             }
-            let loaded = app.results.docs.len();
-            if app.results.evicted > 0 {
+            let loaded = r.docs.len();
+            if r.evicted > 0 {
                 t.push_str(&format!(
                     "(docs {}–{} in window) ",
-                    app.results.evicted + 1,
-                    app.results.evicted + loaded as u64
+                    r.evicted + 1,
+                    r.evicted + loaded as u64
                 ));
             } else {
                 t.push_str(&format!("({loaded} loaded"));
-                t.push_str(if app.results.exhausted {
-                    ", all) "
-                } else {
-                    "+) "
-                });
+                t.push_str(if r.exhausted { ", all) " } else { "+) " });
             }
-            if !app.results.search.is_empty() || app.results.searching {
-                t.push_str(&format!("/{}", app.results.search));
-                if app.results.searching {
+            if !r.search.is_empty() || r.searching {
+                t.push_str(&format!("/{}", r.search));
+                if r.searching {
                     t.push('▏');
                 }
                 t.push(' ');
             }
-            if app.results.loading {
-                t.push_str(spinner(app));
+            if r.loading {
+                t.push_str(spin);
                 t.push(' ');
             }
             t
@@ -314,16 +334,24 @@ fn results_title(app: &App) -> String {
     }
 }
 
-fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Pane::Results;
+/// Draw one results pane (active or parked) into `area`.
+fn draw_results(
+    f: &mut Frame,
+    r: &mut Results,
+    view: ViewMode,
+    focused: bool,
+    numbered: bool,
+    spin: &str,
+    area: Rect,
+) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(focused_style(focused))
-        .title(results_title(app));
+        .title(results_title(r, view, spin, numbered));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if app.results.target.is_none() {
+    if r.target.is_none() {
         let hint = Paragraph::new(Text::from(vec![
             Line::raw(""),
             Line::from(Span::styled(
@@ -339,35 +367,28 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    match app.view {
-        ViewMode::Json => draw_results_json(f, app, inner, focused),
-        ViewMode::Table => draw_results_table(f, app, inner, focused),
+    match view {
+        ViewMode::Json => draw_results_json(f, r, inner, focused),
+        ViewMode::Table => draw_results_table(f, r, inner, focused),
     }
 }
 
-fn draw_results_json(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
+fn draw_results_json(f: &mut Frame, r: &mut Results, inner: Rect, focused: bool) {
     let height = inner.height as usize;
-    let len = app.results.lines.len();
+    let len = r.lines.len();
 
     // Keep cursor visible when it moved via keys.
-    if app.results.cursor < app.results.scroll {
-        app.results.scroll = app.results.cursor;
-    } else if height > 0 && app.results.cursor >= app.results.scroll + height {
-        app.results.scroll = app.results.cursor - height + 1;
+    if r.cursor < r.scroll {
+        r.scroll = r.cursor;
+    } else if height > 0 && r.cursor >= r.scroll + height {
+        r.scroll = r.cursor - height + 1;
     }
-    app.results.scroll = app.results.scroll.min(len.saturating_sub(1));
+    r.scroll = r.scroll.min(len.saturating_sub(1));
 
     let mut lines: Vec<Line> = Vec::with_capacity(height);
-    for (i, rline) in app
-        .results
-        .lines
-        .iter()
-        .enumerate()
-        .skip(app.results.scroll)
-        .take(height)
-    {
+    for (i, rline) in r.lines.iter().enumerate().skip(r.scroll).take(height) {
         let mut line = rline.line.clone();
-        if i == app.results.cursor {
+        if i == r.cursor {
             line.style = Style::new().bg(if focused {
                 theme::sel_bg()
             } else {
@@ -376,7 +397,7 @@ fn draw_results_json(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
         }
         lines.push(line);
     }
-    if len == 0 && !app.results.loading {
+    if len == 0 && !r.loading {
         lines.push(Line::from(Span::styled(
             "  no documents match",
             Style::new().fg(theme::dim()),
@@ -399,10 +420,10 @@ fn pad_cell(s: &str, width: u16) -> String {
     out
 }
 
-fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) {
+fn draw_results_table(f: &mut Frame, r: &mut Results, inner: Rect, focused: bool) {
     let height = inner.height.saturating_sub(1) as usize; // header
-    let rows = app.results.docs.len();
-    let t = &mut app.results.table;
+    let rows = r.docs.len();
+    let t = &mut r.table;
 
     // Keep selected row visible.
     if t.row < t.scroll_row {
@@ -435,7 +456,7 @@ fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) 
 
     // Header + hit ranges.
     t.col_hit.clear();
-    let sort = app.results.active_spec.sort.clone();
+    let sort = r.active_spec.sort.clone();
     let mut header_spans: Vec<Span> = Vec::new();
     let mut x = inner.x;
     for i in t.col_offset..t.columns.len() {
@@ -465,15 +486,14 @@ fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) 
     let mut lines: Vec<Line> = vec![Line::from(header_spans)];
 
     // Rows.
-    for (ri, doc) in app
-        .results
+    for (ri, doc) in r
         .docs
         .iter()
         .enumerate()
-        .skip(app.results.table.scroll_row)
+        .skip(r.table.scroll_row)
         .take(height)
     {
-        let t = &app.results.table;
+        let t = &r.table;
         let mut spans: Vec<Span> = Vec::new();
         let mut x = inner.x;
         for i in t.col_offset..t.columns.len() {
@@ -504,7 +524,7 @@ fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) 
         }
         lines.push(line);
     }
-    if rows == 0 && !app.results.loading {
+    if rows == 0 && !r.loading {
         lines.push(Line::from(Span::styled(
             "  no documents match",
             Style::new().fg(theme::dim()),
@@ -515,7 +535,12 @@ fn draw_results_table(f: &mut Frame, app: &mut App, inner: Rect, focused: bool) 
 
 fn draw_query(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Pane::Query;
-    let mut title_spans = vec![Span::raw(" 3 Query (find filter) ")];
+    // When split, say which pane's filter this is.
+    let label = match (&app.other, &app.results.target) {
+        (Some(_), Some((db, coll))) => format!(" 3 Query ─ {db}.{coll} "),
+        _ => " 3 Query (find filter) ".to_string(),
+    };
+    let mut title_spans = vec![Span::raw(label)];
     if !app.extras.is_default() {
         title_spans.push(Span::styled(
             "+projection/sort/limit — F to edit ",
@@ -615,6 +640,7 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
                 ("↵", "expand/open"),
                 ("/", "filter"),
                 ("r", "refresh"),
+                ("|", "split"),
                 ("tab", "pane"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -1526,6 +1552,10 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         head("Global"),
         Line::from(vec![key("q / ctrl-c"), txt("quit")]),
         Line::from(vec![key("tab / 1 2 3"), txt("switch pane")]),
+        Line::from(vec![
+            key("|"),
+            txt("split: second results pane side by side (toggle)"),
+        ]),
         Line::from(vec![
             key("r"),
             txt("refresh: reload collection (+ sidebar)"),
