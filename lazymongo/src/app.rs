@@ -180,6 +180,9 @@ impl TableView {
 pub struct Results {
     /// (db, collection) currently open.
     pub target: Option<(String, String)>,
+    /// Generation tag of this pane's live query / cursor (0 = none yet).
+    /// Batches carry it back so results route to the right pane.
+    pub generation: u64,
     pub docs: Vec<Document>,
     /// Collapsed fold paths per document ("" = whole doc collapsed).
     pub folds: Vec<HashSet<String>>,
@@ -248,6 +251,17 @@ enum PendingCount {
     UpdateMany { filter: Document, update: Document },
 }
 
+/// Everything that belongs to one results pane. The *active* pane lives
+/// directly in `App` (results / query / extras / view), so the rest of the
+/// code never knows about the split; the inactive pane is parked here and
+/// swapped in whenever it becomes active (see `App::swap_pane`).
+pub struct PaneState {
+    pub results: Results,
+    pub query: QueryBar,
+    pub extras: SpecExtras,
+    pub view: ViewMode,
+}
+
 pub struct App {
     pub conn: ConnState,
     pub uri_display: String,
@@ -258,6 +272,10 @@ pub struct App {
     pub results: Results,
     pub query: QueryBar,
     pub extras: SpecExtras,
+    /// The inactive results pane while the view is split (`|`).
+    pub other: Option<PaneState>,
+    /// Which side the active pane is drawn on when split.
+    pub active_right: bool,
     pub modal: Modal,
     pub screen: Screen,
     /// Aggregation screen state; kept across visits within a session.
@@ -268,7 +286,8 @@ pub struct App {
     pub ops_log: Vec<String>,
     /// The --readonly CLI flag (a saved connection can only add to it).
     cli_read_only: bool,
-    pending_counts: HashMap<u64, PendingCount>,
+    /// Dry-run counts in flight, with the (db, coll) they were started on.
+    pending_counts: HashMap<u64, ((String, String), PendingCount)>,
     next_req_id: u64,
     cancel_tx: watch::Sender<u64>,
     /// Theme name persisted in config.toml (None = default).
@@ -300,11 +319,15 @@ pub struct App {
     pub toast: Option<(String, bool, Instant)>, // (message, is_error, when)
     pub spinner_frame: usize,
     pub should_quit: bool,
-    pub generation: u64,
+    /// Monotonic allocator for query generations; each pane's live query and
+    /// the aggregation preview carry their own tag (`Results::generation`).
+    next_gen: u64,
     cmd_tx: mpsc::Sender<Command>,
-    // Pane hit-test rects, updated by ui::draw each frame.
+    // Pane hit-test rects, updated by ui::draw each frame. `results_area` is
+    // the active pane, `other_area` the parked one (empty when not split).
     pub explorer_area: Rect,
     pub results_area: Rect,
+    pub other_area: Rect,
     pub query_area: Rect,
 }
 
@@ -326,6 +349,8 @@ impl App {
             results: Results::default(),
             query: QueryBar::default(),
             extras: SpecExtras::default(),
+            other: None,
+            active_right: false,
             modal: Modal::None,
             screen: Screen::Main,
             agg: None,
@@ -352,12 +377,91 @@ impl App {
             toast: None,
             spinner_frame: 0,
             should_quit: false,
-            generation: 0,
+            next_gen: 0,
             cmd_tx,
             explorer_area: Rect::default(),
             results_area: Rect::default(),
+            other_area: Rect::default(),
             query_area: Rect::default(),
         }
+    }
+
+    // ---------- split view ----------
+
+    /// Make the parked pane the active one (and vice versa). Everything the
+    /// rest of the code touches as "the results" swaps in one go, including
+    /// the hit-test rects, so the swap is invisible to callers.
+    fn swap_pane(&mut self) {
+        let Some(o) = &mut self.other else { return };
+        std::mem::swap(&mut self.results, &mut o.results);
+        std::mem::swap(&mut self.query, &mut o.query);
+        std::mem::swap(&mut self.extras, &mut o.extras);
+        std::mem::swap(&mut self.view, &mut o.view);
+        std::mem::swap(&mut self.results_area, &mut self.other_area);
+        self.active_right = !self.active_right;
+    }
+
+    /// Run `f` against the parked pane by temporarily swapping it in.
+    fn with_other(&mut self, f: impl FnOnce(&mut Self)) {
+        if self.other.is_none() {
+            return;
+        }
+        self.swap_pane();
+        f(self);
+        self.swap_pane();
+    }
+
+    /// `|`: open a second, empty results pane on the right and send the user
+    /// to the explorer to fill it; when already split, close the inactive
+    /// pane and keep the active one.
+    fn toggle_split(&mut self) {
+        match self.other.take() {
+            Some(o) => {
+                self.close_cursor(o.results.generation);
+                self.active_right = false;
+                self.other_area = Rect::default();
+            }
+            None => {
+                self.other = Some(PaneState {
+                    results: Results::default(),
+                    query: QueryBar::default(),
+                    extras: SpecExtras::default(),
+                    view: self.view,
+                });
+                self.active_right = false;
+                self.swap_pane(); // the new pane is active, on the right
+                self.focus = Pane::Explorer;
+                self.toast_info(
+                    "split: open a collection for the right pane (tab switches, | closes)".into(),
+                );
+            }
+        }
+    }
+
+    /// Focus a results pane by side (spatial tab order when split).
+    fn focus_side(&mut self, right: bool) {
+        if self.other.is_some() && self.active_right != right {
+            self.swap_pane();
+        }
+        self.focus = Pane::Results;
+    }
+
+    /// Release the actor's cursor for a query no pane shows any more.
+    fn close_cursor(&mut self, generation: u64) {
+        if generation != 0 {
+            self.send(Command::CloseFind { generation });
+        }
+    }
+
+    /// The results pane (active or parked) whose live query is `generation`.
+    fn results_for(&mut self, generation: u64) -> Option<&mut Results> {
+        if self.results.generation == generation {
+            return Some(&mut self.results);
+        }
+        self.other
+            .as_mut()
+            .map(|o| &mut o.results)
+            .filter(|r| r.generation == generation)
     }
 
     pub fn send(&mut self, cmd: Command) {
@@ -374,9 +478,13 @@ impl App {
         self.toast = Some((msg, false, Instant::now()));
     }
 
-    /// Abort the in-flight find/aggregation, if any (FR-16).
+    /// Abort the in-flight find (active pane) or aggregation, if any (FR-16).
     fn cancel_current(&mut self) {
-        let _ = self.cancel_tx.send(self.generation);
+        let generation = match self.screen {
+            Screen::Agg => self.agg.as_ref().map(|a| a.generation).unwrap_or(0),
+            Screen::Main => self.results.generation,
+        };
+        let _ = self.cancel_tx.send(generation);
         self.toast_info("cancelling…".into());
     }
 
@@ -455,8 +563,8 @@ impl App {
                 generation,
                 estimate,
             } => {
-                if generation == self.generation {
-                    self.results.total_estimate = Some(estimate);
+                if let Some(r) = self.results_for(generation) {
+                    r.total_estimate = Some(estimate);
                 }
             }
             CoreEvent::Batch {
@@ -464,37 +572,16 @@ impl App {
                 docs,
                 exhausted,
             } => {
-                if generation != self.generation {
-                    return; // stale query
-                }
-                self.results.loading = false;
-                self.results.exhausted = exhausted;
-                for _ in 0..docs.len() {
-                    let mut collapsed = HashSet::new();
-                    collapsed.insert(String::new()); // docs arrive collapsed
-                    self.results.folds.push(collapsed);
-                }
-                self.results.docs.extend(docs);
-                // Sliding window eviction (NFR-3).
-                while self.results.docs.len() > MAX_DOCS {
-                    let n = BATCH_SIZE.min(self.results.docs.len());
-                    self.results.docs.drain(..n);
-                    self.results.folds.drain(..n);
-                    self.results.evicted += n as u64;
-                }
-                if self.results.evicted > 0 {
-                    self.toast_info(format!(
-                        "{} earlier docs unloaded to cap memory (r reloads from start)",
-                        self.results.evicted
-                    ));
-                }
-                self.results.dirty = true;
-                // The first batch is intentionally tiny for instant paint;
-                // top it up to a full page in the background.
-                if !self.results.exhausted && self.results.docs.len() < BATCH_SIZE {
-                    self.results.loading = true;
-                    let generation = self.generation;
-                    self.send(Command::NextBatch { generation });
+                // Route to whichever pane owns this query; anything else is
+                // a stale batch from a superseded query.
+                if generation == self.results.generation {
+                    self.on_batch(docs, exhausted);
+                } else if self
+                    .other
+                    .as_ref()
+                    .is_some_and(|o| o.results.generation == generation)
+                {
+                    self.with_other(|app| app.on_batch(docs, exhausted));
                 }
             }
             CoreEvent::ExplainResult(plan) => {
@@ -525,21 +612,30 @@ impl App {
                 self.ops_log
                     .push(format!("{}  {namespace}: {summary}", util::clock_utc()));
                 self.toast_info(summary);
-                let current_ns = self
-                    .results
-                    .target
-                    .as_ref()
-                    .map(|(d, c)| format!("{d}.{c}"));
-                if refresh && current_ns.as_deref() == Some(namespace.as_str()) {
+                // Both panes may show the written collection.
+                let shows = |r: &Results| {
+                    r.target.as_ref().map(|(d, c)| format!("{d}.{c}")) == Some(namespace.clone())
+                };
+                if refresh && shows(&self.results) {
                     self.rerun_find();
+                }
+                if refresh && self.other.as_ref().is_some_and(|o| shows(&o.results)) {
+                    self.with_other(|app| app.rerun_find());
                 }
             }
             CoreEvent::Cancelled { generation } => {
-                if generation == self.generation {
-                    self.results.loading = false;
-                    if let Some(agg) = &mut self.agg {
+                let mut ours = false;
+                if let Some(r) = self.results_for(generation) {
+                    r.loading = false;
+                    ours = true;
+                }
+                if let Some(agg) = &mut self.agg {
+                    if agg.generation == generation {
                         agg.running = false;
+                        ours = true;
                     }
+                }
+                if ours {
                     self.toast_info("query cancelled".into());
                 }
             }
@@ -572,31 +668,75 @@ impl App {
                 }
             }
             CoreEvent::AggBatch { generation, docs } => {
-                if generation != self.generation {
-                    return;
-                }
                 if let Some(agg) = &mut self.agg {
-                    let ran_through = agg.selected_stage;
-                    agg.set_docs(docs, ran_through);
+                    if agg.generation == generation {
+                        let ran_through = agg.selected_stage;
+                        agg.set_docs(docs, ran_through);
+                    }
                 }
             }
         }
     }
 
+    /// One page of results arrived for the active pane.
+    fn on_batch(&mut self, docs: Vec<Document>, exhausted: bool) {
+        self.results.loading = false;
+        self.results.exhausted = exhausted;
+        for _ in 0..docs.len() {
+            let mut collapsed = HashSet::new();
+            collapsed.insert(String::new()); // docs arrive collapsed
+            self.results.folds.push(collapsed);
+        }
+        self.results.docs.extend(docs);
+        // Sliding window eviction (NFR-3).
+        while self.results.docs.len() > MAX_DOCS {
+            let n = BATCH_SIZE.min(self.results.docs.len());
+            self.results.docs.drain(..n);
+            self.results.folds.drain(..n);
+            self.results.evicted += n as u64;
+        }
+        if self.results.evicted > 0 {
+            self.toast_info(format!(
+                "{} earlier docs unloaded to cap memory (r reloads from start)",
+                self.results.evicted
+            ));
+        }
+        self.results.dirty = true;
+        // The first batch is intentionally tiny for instant paint;
+        // top it up to a full page in the background.
+        if !self.results.exhausted && self.results.docs.len() < BATCH_SIZE {
+            self.results.loading = true;
+            let generation = self.results.generation;
+            self.send(Command::NextBatch { generation });
+        }
+    }
+
     /// A dry-run count came back: open the corresponding confirmation.
     fn on_count_result(&mut self, req_id: u64, n: u64) {
-        let Some(pending) = self.pending_counts.remove(&req_id) else {
+        let Some((target, pending)) = self.pending_counts.remove(&req_id) else {
             return;
         };
+        // The confirm executes against the active pane's collection, so it
+        // must still be the one the count ran on (the user may have switched
+        // panes or collections while the count was in flight).
+        if self.results.target.as_ref() != Some(&target) {
+            self.toast_err(format!(
+                "{}.{} is no longer the active collection — cancelled",
+                target.0, target.1
+            ));
+            return;
+        }
         if n == 0 {
             self.toast_info("filter matches 0 documents — nothing to do".into());
             return;
         }
+        let ns = format!("collection: {}.{}", target.0, target.1);
         match pending {
             PendingCount::DeleteMany { filter } => {
                 self.modal = Modal::Confirm(Confirm {
                     title: "Delete many".into(),
                     body: vec![
+                        ns,
                         format!("filter: {}", filter_display(&filter)),
                         format!("{n} document(s) will be PERMANENTLY deleted."),
                         String::new(),
@@ -611,6 +751,7 @@ impl App {
                 self.modal = Modal::Confirm(Confirm {
                     title: "Update many".into(),
                     body: vec![
+                        ns,
                         format!("filter: {}", filter_display(&filter)),
                         format!("update: {}", filter_display(&update)),
                         String::new(),
@@ -788,6 +929,7 @@ impl App {
             KeyCode::Char('1') => self.focus = Pane::Explorer,
             KeyCode::Char('2') => self.focus = Pane::Results,
             KeyCode::Char('3') => self.focus = Pane::Query,
+            KeyCode::Char('|') => self.toggle_split(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('C') => self.open_connections(),
             KeyCode::Char('u') if self.update_available.is_some() => self.prompt_self_update(),
@@ -1154,14 +1296,17 @@ impl App {
             Err(e) => self.toast_err(e),
             Ok(uri) => {
                 // Reset all per-connection state (also handles re-connects).
+                // Fresh panes have generation 0, which no in-flight batch
+                // carries, so stale results from the old connection are dropped.
                 self.explorer = Explorer::default();
                 self.results = Results::default();
                 self.query = QueryBar::default();
                 self.extras = SpecExtras::default();
+                self.other = None;
+                self.active_right = false;
                 self.agg = None;
                 self.screen = Screen::Main;
                 self.focus = Pane::Explorer;
-                self.generation += 1; // invalidate in-flight batches
 
                 let effective_ro = self.cli_read_only || conn.read_only;
                 self.read_only = effective_ro;
@@ -1243,9 +1388,21 @@ impl App {
                 }
             }
             PendingAction::DropCollection { db, coll } => {
-                // If the dropped collection is open, clear the results pane.
-                if self.results.target.as_ref() == Some(&(db.clone(), coll.clone())) {
-                    self.results = Results::default();
+                // If the dropped collection is open (in either pane), clear it.
+                let dropped = (db.clone(), coll.clone());
+                if self.results.target.as_ref() == Some(&dropped) {
+                    let g = std::mem::take(&mut self.results).generation;
+                    self.close_cursor(g);
+                }
+                if self
+                    .other
+                    .as_ref()
+                    .is_some_and(|o| o.results.target.as_ref() == Some(&dropped))
+                {
+                    self.with_other(|app| {
+                        let g = std::mem::take(&mut app.results).generation;
+                        app.close_cursor(g);
+                    });
                 }
                 self.send(Command::DropCollection { db, coll });
             }
@@ -1398,7 +1555,8 @@ impl App {
         };
         self.next_req_id += 1;
         let req_id = self.next_req_id;
-        self.pending_counts.insert(req_id, pending);
+        self.pending_counts
+            .insert(req_id, ((db.clone(), coll.clone()), pending));
         self.toast_info("counting matching documents…".into());
         self.send(Command::Count {
             req_id,
@@ -1462,6 +1620,10 @@ impl App {
             (
                 "view: toggle json / table (v)".into(),
                 AppAction::ToggleView,
+            ),
+            (
+                "view: split — second results pane side by side (|)".into(),
+                AppAction::ToggleSplit,
             ),
             (
                 "query: structured editor — filter/projection/sort/limit (F)".into(),
@@ -1572,6 +1734,7 @@ impl App {
                     ViewMode::Table => ViewMode::Json,
                 }
             }
+            AppAction::ToggleSplit => self.toggle_split(),
             AppAction::QueryEditor => self.open_query_editor(),
             AppAction::Explain => self.explain_current(),
             AppAction::DocView => self.open_doc_view(),
@@ -1608,15 +1771,29 @@ impl App {
         }
     }
 
+    /// Tab order is spatial: explorer → left results → (right results) →
+    /// query. Landing on a results pane makes it the active one.
     fn cycle_focus(&mut self, back: bool) {
-        self.focus = match (self.focus, back) {
-            (Pane::Explorer, false) => Pane::Results,
-            (Pane::Results, false) => Pane::Query,
-            (Pane::Query, false) => Pane::Explorer,
-            (Pane::Explorer, true) => Pane::Query,
-            (Pane::Results, true) => Pane::Explorer,
-            (Pane::Query, true) => Pane::Results,
+        let split = self.other.is_some();
+        // Positions: 0 explorer, 1 left results, 2 right results, 3 query.
+        let stops: &[usize] = if split { &[0, 1, 2, 3] } else { &[0, 1, 3] };
+        let current = match self.focus {
+            Pane::Explorer => 0,
+            Pane::Results if split && self.active_right => 2,
+            Pane::Results => 1,
+            Pane::Query => 3,
         };
+        let i = stops.iter().position(|&s| s == current).unwrap_or(0);
+        let next = if back {
+            stops[(i + stops.len() - 1) % stops.len()]
+        } else {
+            stops[(i + 1) % stops.len()]
+        };
+        match next {
+            0 => self.focus = Pane::Explorer,
+            3 => self.focus = Pane::Query,
+            side => self.focus_side(side == 2),
+        }
     }
 
     /// r: reload the open collection from the server (keeps the active
@@ -1652,7 +1829,15 @@ impl App {
     }
 
     fn start_find(&mut self, db: String, coll: String, spec: FindSpec) {
-        self.generation += 1;
+        // Retire this pane's previous query: abort it if still in flight and
+        // release its cursor. The new generation makes its late batches stale.
+        let old = self.results.generation;
+        if old != 0 && self.results.loading {
+            let _ = self.cancel_tx.send(old);
+        }
+        self.close_cursor(old);
+        self.next_gen += 1;
+        let generation = self.next_gen;
         // Load persisted history when switching collections (FR-13).
         let ns = format!("{db}.{coll}");
         if self
@@ -1667,6 +1852,7 @@ impl App {
         }
         let r = &mut self.results;
         r.target = Some((db.clone(), coll.clone()));
+        r.generation = generation;
         r.docs.clear();
         r.folds.clear();
         r.lines.clear();
@@ -1680,7 +1866,6 @@ impl App {
         r.evicted = 0;
         r.active_spec = spec.clone();
         r.dirty = true;
-        let generation = self.generation;
         self.send(Command::StartFind {
             generation,
             db,
@@ -2224,7 +2409,14 @@ impl App {
         let upto = upto.unwrap_or(stages.len() - 1).min(stages.len() - 1);
         stages.truncate(upto + 1);
         agg.selected_stage = upto;
+        if agg.running {
+            // Re-run while one is in flight: abort the old preview first.
+            let _ = self.cancel_tx.send(agg.generation);
+        }
         agg.running = true;
+        self.next_gen += 1;
+        agg.generation = self.next_gen;
+        let generation = agg.generation;
         let ns = format!("{}.{}", agg.db, agg.coll);
         let pipeline_text = agg.editor.text();
         let (db, coll) = (agg.db.clone(), agg.coll.clone());
@@ -2233,8 +2425,6 @@ impl App {
         if let Err(e) = config::save_state(&self.state) {
             self.toast_err(format!("could not save state: {e}"));
         }
-        self.generation += 1;
-        let generation = self.generation;
         self.send(Command::Aggregate {
             generation,
             db,
@@ -2557,7 +2747,7 @@ impl App {
         };
         if near_end {
             self.results.loading = true;
-            let generation = self.generation;
+            let generation = self.results.generation;
             self.send(Command::NextBatch { generation });
         }
     }
@@ -2802,6 +2992,21 @@ impl App {
                 _ => {}
             }
             return;
+        }
+        // Clicks on the parked pane make it active first, then fall through
+        // to the normal results handling (swap_pane also swaps the rects).
+        // The wheel scrolls it in place without changing the active pane.
+        if self.other_area.contains(pos) {
+            match m.kind {
+                MouseEventKind::Down(_) => self.swap_pane(),
+                MouseEventKind::ScrollDown => {
+                    return self.with_other(|app| app.scroll_under_mouse(pos, 3))
+                }
+                MouseEventKind::ScrollUp => {
+                    return self.with_other(|app| app.scroll_under_mouse(pos, -3))
+                }
+                _ => {}
+            }
         }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -3180,6 +3385,9 @@ async fn run_loop(
         if app.results.dirty {
             app.results.rebuild_lines();
         }
+        if let Some(o) = app.other.as_mut().filter(|o| o.results.dirty) {
+            o.results.rebuild_lines();
+        }
         terminal.draw(|f| ui::draw(f, &mut app))?;
         tokio::select! {
             Some(ev) = input_rx.recv() => {
@@ -3314,5 +3522,68 @@ mod tests {
         let (keys, options) = split_index_spec(&doc! { "keys": 1 }).unwrap();
         assert_eq!(keys, doc! { "keys": 1 });
         assert!(options.is_empty());
+    }
+
+    fn test_app() -> (App, mpsc::Receiver<Command>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (cancel_tx, _cancel_rx) = watch::channel(0u64);
+        (App::new(String::new(), cmd_tx, cancel_tx, false), cmd_rx)
+    }
+
+    #[test]
+    fn split_swaps_pane_state_and_tab_walks_both_panes() {
+        let (mut app, _rx) = test_app();
+        app.results.target = Some(("db".into(), "left".into()));
+        app.view = ViewMode::Table;
+        let target = |app: &App| app.results.target.as_ref().map(|t| t.1.clone());
+
+        // Unsplit: explorer → results → query → explorer.
+        app.focus = Pane::Explorer;
+        app.cycle_focus(false);
+        assert_eq!(app.focus, Pane::Results);
+        app.cycle_focus(false);
+        assert_eq!(app.focus, Pane::Query);
+        app.cycle_focus(false);
+        assert_eq!(app.focus, Pane::Explorer);
+
+        // | parks the current pane on the left and activates an empty right
+        // pane (same view mode), sending the user to the explorer.
+        app.toggle_split();
+        assert!(app.active_right);
+        assert_eq!(app.focus, Pane::Explorer);
+        assert_eq!(target(&app), None);
+        assert_eq!(app.view, ViewMode::Table);
+        let parked = app.other.as_ref().unwrap();
+        assert_eq!(parked.results.target.as_ref().unwrap().1, "left");
+
+        // Tab order is spatial: explorer → left → right → query → explorer.
+        app.cycle_focus(false);
+        assert_eq!((app.focus, app.active_right), (Pane::Results, false));
+        assert_eq!(target(&app).as_deref(), Some("left"));
+        app.cycle_focus(false);
+        assert_eq!((app.focus, app.active_right), (Pane::Results, true));
+        assert_eq!(target(&app), None);
+        app.cycle_focus(false);
+        assert_eq!(app.focus, Pane::Query);
+        app.cycle_focus(true);
+        assert_eq!((app.focus, app.active_right), (Pane::Results, true));
+        app.cycle_focus(true);
+        assert_eq!((app.focus, app.active_right), (Pane::Results, false));
+
+        // Batches route by generation to the parked pane.
+        app.other.as_mut().unwrap().results.generation = 7;
+        app.on_core(CoreEvent::Batch {
+            generation: 7,
+            docs: vec![doc! { "a": 1 }],
+            exhausted: true,
+        });
+        assert_eq!(app.other.as_ref().unwrap().results.docs.len(), 1);
+        assert!(app.results.docs.is_empty());
+
+        // Closing the split keeps the active (left) pane.
+        app.toggle_split();
+        assert!(app.other.is_none());
+        assert!(!app.active_right);
+        assert_eq!(target(&app).as_deref(), Some("left"));
     }
 }

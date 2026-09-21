@@ -774,3 +774,104 @@ async fn schema_sampling() {
         other => panic!("expected SchemaSample, got {other:?}"),
     }
 }
+
+/// Split view: two panes page their own cursors independently, cancelling
+/// one generation never touches the other, and CloseFind releases a cursor.
+#[tokio::test]
+async fn two_live_cursors_are_independent() {
+    let Some(uri) = test_uri() else {
+        return;
+    };
+    ensure_seeded(&uri).await;
+    let (cmd, mut evt, cancel) = actor::spawn(false);
+    cmd.send(Command::Connect {
+        uri,
+        dns: lazymongo_core::types::DnsResolver::System,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(recv(&mut evt).await, CoreEvent::Connected { .. }));
+
+    // One unlimited find per pane; both cursors stay live.
+    for (generation, coll) in [(1u64, "users"), (2u64, "orders")] {
+        cmd.send(Command::StartFind {
+            generation,
+            db: "app_db".into(),
+            coll: coll.into(),
+            spec: spec(""),
+        })
+        .await
+        .unwrap();
+        match recv(&mut evt).await {
+            CoreEvent::Batch {
+                generation: g,
+                docs,
+                exhausted,
+            } => {
+                assert_eq!(g, generation);
+                assert_eq!(docs.len(), FIRST_BATCH_SIZE);
+                assert!(!exhausted);
+            }
+            other => panic!("expected first batch of gen {generation}, got {other:?}"),
+        }
+    }
+
+    // Paging one pane does not disturb the other (500 users, 75 orders).
+    for generation in [1u64, 2, 1] {
+        cmd.send(Command::NextBatch { generation }).await.unwrap();
+        match recv(&mut evt).await {
+            CoreEvent::Batch {
+                generation: g,
+                docs,
+                exhausted,
+            } => {
+                assert_eq!(g, generation);
+                assert_eq!(docs.len(), BATCH_SIZE);
+                assert!(!exhausted);
+            }
+            other => panic!("expected gen-{generation} page, got {other:?}"),
+        }
+    }
+
+    // Cancel is an exact match: cancelling pane 2 leaves pane 1 usable.
+    cancel.send(2).unwrap();
+    cmd.send(Command::NextBatch { generation: 1 })
+        .await
+        .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::Batch {
+            generation: 1,
+            docs,
+            ..
+        } => assert_eq!(docs.len(), BATCH_SIZE),
+        other => panic!("gen 1 poisoned by cancelling gen 2: {other:?}"),
+    }
+
+    // CloseFind releases the cursor: a later pull is silently ignored, so
+    // the next event is the fresh gen-3 batch, not a gen-1 one.
+    cmd.send(Command::CloseFind { generation: 1 })
+        .await
+        .unwrap();
+    cmd.send(Command::NextBatch { generation: 1 })
+        .await
+        .unwrap();
+    cmd.send(Command::StartFind {
+        generation: 3,
+        db: "app_db".into(),
+        coll: "users".into(),
+        spec: FindSpec {
+            limit: Some(1),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+    match recv(&mut evt).await {
+        CoreEvent::Batch {
+            generation: 3,
+            docs,
+            ..
+        } => assert_eq!(docs.len(), 1),
+        other => panic!("closed gen-1 cursor leaked a batch: {other:?}"),
+    }
+}

@@ -1,7 +1,9 @@
 //! The Mongo I/O actor: a single async task that owns the driver client and
-//! the live query cursor. The UI sends [`Command`]s and receives
-//! [`CoreEvent`]s over channels, so no network call ever blocks a frame.
+//! the live query cursors (one per open results pane, keyed by generation).
+//! The UI sends [`Command`]s and receives [`CoreEvent`]s over channels, so
+//! no network call ever blocks a frame.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, TryStreamExt};
@@ -34,7 +36,8 @@ const MAX_POOL_SIZE: u32 = 20;
 /// Spawn the actor on the current tokio runtime.
 /// `read_only` rejects every write command at the I/O layer (FR-4).
 /// The returned watch sender cancels in-flight finds/aggregations: sending a
-/// generation g aborts any operation whose generation is <= g (FR-16).
+/// generation g aborts the operation tagged exactly g (FR-16). Exact match,
+/// not a threshold, so cancelling one results pane never touches the other.
 pub fn spawn(
     read_only: bool,
 ) -> (
@@ -49,11 +52,11 @@ pub fn spawn(
     (cmd_tx, evt_rx, cancel_tx)
 }
 
-/// Resolves when the cancel watch reaches `generation` (never resolves if the
+/// Resolves when the cancel watch holds `generation` (never resolves if the
 /// sender is dropped — the racing operation future finishes instead).
 async fn cancelled(rx: &mut watch::Receiver<u64>, generation: u64) {
     loop {
-        if *rx.borrow() >= generation {
+        if *rx.borrow() == generation {
             return;
         }
         if rx.changed().await.is_err() {
@@ -64,8 +67,9 @@ async fn cancelled(rx: &mut watch::Receiver<u64>, generation: u64) {
 
 struct Actor {
     client: Option<Client>,
-    cursor: Option<Cursor<Document>>,
-    generation: u64,
+    /// Live find cursors by query generation. The UI closes the ones it
+    /// stops showing (CloseFind); exhausted/failed ones drop themselves.
+    cursors: HashMap<u64, Cursor<Document>>,
     read_only: bool,
     events: mpsc::Sender<CoreEvent>,
     cancel_rx: watch::Receiver<u64>,
@@ -79,8 +83,7 @@ async fn run(
 ) {
     let mut actor = Actor {
         client: None,
-        cursor: None,
-        generation: 0,
+        cursors: HashMap::new(),
         read_only,
         events,
         cancel_rx,
@@ -133,7 +136,10 @@ impl Actor {
                 coll,
                 spec,
             } => self.start_find(generation, db, coll, spec).await,
-            Command::NextBatch { generation } => self.next_batch(generation).await,
+            Command::NextBatch { generation } => self.pull_batch(generation, BATCH_SIZE).await,
+            Command::CloseFind { generation } => {
+                self.cursors.remove(&generation);
+            }
             Command::Explain { db, coll, spec } => self.explain(db, coll, spec).await,
             Command::Count {
                 req_id,
@@ -231,6 +237,7 @@ impl Actor {
 
         match result {
             Ok((client, server_version, ping_ms)) => {
+                self.cursors.clear(); // cursors of a previous connection
                 self.client = Some(client);
                 Self::emit(
                     &self.events,
@@ -344,9 +351,6 @@ impl Actor {
         if !self.connected() {
             return;
         }
-        self.generation = generation;
-        self.cursor = None;
-
         let collection = self.coll(&db, &coll);
         // The estimate is cosmetic (title bar): compute it in the background
         // so it never delays the first batch.
@@ -390,7 +394,7 @@ impl Actor {
         match result {
             None => Self::emit(&self.events, CoreEvent::Cancelled { generation }).await,
             Some(Ok(cursor)) => {
-                self.cursor = Some(cursor);
+                self.cursors.insert(generation, cursor);
                 // Small first pull: paint the screen as soon as possible.
                 self.pull_batch(generation, FIRST_BATCH_SIZE).await;
             }
@@ -398,16 +402,11 @@ impl Actor {
         }
     }
 
-    async fn next_batch(&mut self, generation: u64) {
-        if generation != self.generation {
-            return; // stale request from a superseded query
-        }
-        self.pull_batch(generation, BATCH_SIZE).await;
-    }
-
+    /// Pull up to `target` docs from the cursor of `generation`. Silently a
+    /// no-op when there is no such cursor (superseded or closed query).
     async fn pull_batch(&mut self, generation: u64, target: usize) {
         let mut cancel = self.cancel_rx.clone();
-        let Some(cursor) = &mut self.cursor else {
+        let Some(cursor) = self.cursors.get_mut(&generation) else {
             return;
         };
         let mut docs = Vec::with_capacity(target);
@@ -416,7 +415,7 @@ impl Actor {
             let item = tokio::select! {
                 r = cursor.try_next() => r,
                 _ = cancelled(&mut cancel, generation) => {
-                    self.cursor = None;
+                    self.cursors.remove(&generation);
                     Self::emit(&self.events, CoreEvent::Cancelled { generation }).await;
                     return;
                 }
@@ -430,11 +429,11 @@ impl Actor {
                 }
                 Ok(None) => {
                     exhausted = true;
-                    self.cursor = None;
+                    self.cursors.remove(&generation);
                     break;
                 }
                 Err(e) => {
-                    self.cursor = None;
+                    self.cursors.remove(&generation);
                     Self::emit_err(&self.events, format!("cursor: {e}")).await;
                     exhausted = true;
                     break;

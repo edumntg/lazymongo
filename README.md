@@ -86,6 +86,9 @@ and through the fuzzy **command palette** (`Ctrl-P` or `:`).
   `E` **streaming export** of the full query result to JSON/CSV (not just the loaded window)
 - `S` **schema view**: sampled field presence and types for the collection
 - `Ctrl-T` fuzzy **namespace switcher** — jump to any `db.collection` by name
+- `|` **split view**: two results panes side by side to compare collections
+  (or two filters on the same one) — each pane keeps its own filter, view
+  mode and infinite scroll; `Tab` or a click switches, `|` closes
 
 ### Write operations — always confirmed, always logged
 - `e` edit (JSON editor with a field-level diff before `replaceOne`) — or `Ctrl-E`
@@ -164,6 +167,7 @@ read_only = true             # RO badge + all writes blocked
 | Key | Action |
 |---|---|
 | `Tab` / `1` `2` `3` | Switch pane (explorer / results / query) |
+| `\|` | Split: second results pane side by side (toggle; `Tab` / click switches) |
 | `↑↓` `jk` / mouse wheel | Move |
 | `Enter` | Expand db · open collection · fold/unfold |
 | `z` | Expand / collapse all nested fields of the doc under the cursor |

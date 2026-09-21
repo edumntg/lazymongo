@@ -314,6 +314,8 @@ pub enum AppAction {
     },
     NsSwitcher,
     ToggleView,
+    /// Open / close the second results pane (side-by-side compare).
+    ToggleSplit,
     QueryEditor,
     Explain,
     DocView,

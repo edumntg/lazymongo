@@ -70,6 +70,8 @@ pub struct AggState {
     pub selected_stage: usize,
     pub error: Option<String>,
     pub running: bool,
+    /// Generation tag of the in-flight/last preview run (0 = never ran).
+    pub generation: u64,
     /// Stage index (0-based) the current preview ran through.
     pub ran_through: Option<usize>,
     pub docs: Vec<Document>,
@@ -97,6 +99,7 @@ impl AggState {
             selected_stage: 0,
             error: None,
             running: false,
+            generation: 0,
             ran_through: None,
             docs: Vec::new(),
             folds: Vec::new(),
